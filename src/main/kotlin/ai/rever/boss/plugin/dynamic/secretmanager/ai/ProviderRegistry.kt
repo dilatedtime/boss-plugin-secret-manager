@@ -14,6 +14,10 @@ package ai.rever.boss.plugin.dynamic.secretmanager.ai
  */
 object ProviderRegistry {
     const val ANTHROPIC: String = "ANTHROPIC"
+    /** Same precedence used for stored credentials and secret-card navigation. */
+    fun storedProviderId(website: String, tags: List<String>): String? =
+        find(website)?.id ?: tags.firstNotNullOfOrNull { find(it)?.id }
+
     const val OPENAI: String = "OPENAI"
     const val GOOGLE: String = "GOOGLE"
     const val XAI: String = "XAI"

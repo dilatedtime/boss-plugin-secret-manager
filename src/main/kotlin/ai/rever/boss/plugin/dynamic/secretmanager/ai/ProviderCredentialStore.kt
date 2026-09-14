@@ -870,8 +870,7 @@ class ProviderCredentialStore(
     private fun providerIdOf(entry: SecretEntryData): String? = providerIdOf(entry.website, entry.tags)
 
     private fun providerIdOf(website: String, tags: List<String>): String? =
-        ProviderRegistry.find(website)?.id
-            ?: tags.firstNotNullOfOrNull { tag -> ProviderRegistry.find(tag)?.id }
+        ProviderRegistry.storedProviderId(website, tags)
 
     private fun toStored(
         providerId: String,

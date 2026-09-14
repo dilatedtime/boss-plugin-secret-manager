@@ -7,6 +7,7 @@ import ai.rever.boss.plugin.ui.BossSecondaryButton
 import ai.rever.boss.plugin.ui.BossSection
 import ai.rever.boss.plugin.ui.BossTextField
 import ai.rever.boss.plugin.ui.BossThemeColors
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -21,6 +22,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -35,6 +38,7 @@ import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -45,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -62,9 +67,11 @@ import kotlin.math.roundToInt
 fun AiProvidersPanel(
     viewModel: AiProvidersViewModel,
     modifier: Modifier = Modifier,
+    scrollState: ScrollState = rememberScrollState(),
 ) {
+    LaunchedEffect(viewModel) { viewModel.enterSection() }
     val state by viewModel.state.collectAsState()
-    val selected = state.providers.firstOrNull { it.id == state.selectedProviderId } ?: ProviderRegistry.default
+    val selected = state.providers.firstOrNull { it.id == state.selectedProviderId }
 
     // Scrolls itself: the host registers this as an embedded panel and does not wrap it
     // in a scroll container (nesting two would measure with infinite height and crash).
@@ -74,7 +81,7 @@ fun AiProvidersPanel(
         modifier =
             modifier
                 .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scrollState)
                 .padding(vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
@@ -107,7 +114,6 @@ fun AiProvidersPanel(
         // one list read as more structure than is here.
         BossSection(
             title = "Available Providers",
-            description = "Providers available for AI features across every plugin.",
         ) {
             // Where the CLI subsection would be. The gateway serving no engines is still
             // silence, but the gateway being *absent* is a thing the user can fix, and
@@ -134,8 +140,7 @@ fun AiProvidersPanel(
                 )
                 Text(
                     text =
-                        "Use a CLI you have already signed into. No API key, billed to that " +
-                            "subscription. Selecting one replaces the provider below for every plugin.",
+                        "A login you already have. Overrides the provider below.",
                     style = SecretPanelType.meta,
                     color = BossThemeColors.TextSecondary,
                     modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
@@ -189,8 +194,17 @@ fun AiProvidersPanel(
                             // a row as open when the card below it is closed.
                             isSelected = state.isEditorOpen && descriptor.id == state.selectedProviderId,
                             isActive = descriptor.id == state.activeProviderId,
-                            onClick = { viewModel.selectProvider(descriptor.id) },
+                            onClick = { viewModel.toggleProvider(descriptor.id) },
                         )
+                        if (state.isEditorOpen && descriptor.id == state.selectedProviderId) {
+                            ProviderDetail(
+                                descriptor = descriptor,
+                                state = state,
+                                viewModel = viewModel,
+                                onCancel = viewModel::closeEditor,
+                                showTitle = false,
+                            )
+                        }
                     }
                 }
 
@@ -215,20 +229,15 @@ fun AiProvidersPanel(
                     onPick = viewModel::selectProvider,
                     onPickCustom = { viewModel.selectProvider(ProviderRegistry.CUSTOM) },
                 )
+                if (state.isEditorOpen && selected != null && selected.id !in listedIds) {
+                    ProviderDetail(
+                        descriptor = selected,
+                        state = state,
+                        viewModel = viewModel,
+                        onCancel = viewModel::closeEditor,
+                    )
+                }
             }
-        }
-
-        // The editor: closed by default on every fresh visit, and opened only by picking a
-        // row above or one of the two Add buttons. Never rendered unconditionally — a form
-        // that is always open, whether or not anyone asked for it, is exactly what made an
-        // "Available Providers" list read as cluttered before this.
-        if (state.isEditorOpen) {
-            ProviderDetail(
-                descriptor = selected,
-                state = state,
-                viewModel = viewModel,
-                onCancel = viewModel::closeEditor,
-            )
         }
     }
 }
@@ -534,6 +543,7 @@ private fun ProviderDetail(
     state: AiProvidersUiState,
     viewModel: AiProvidersViewModel,
     onCancel: () -> Unit,
+    showTitle: Boolean = true,
 ) {
     val connection = state.connectionOf(descriptor.id)
     val busy = descriptor.id in state.busyProviderIds
@@ -550,21 +560,31 @@ private fun ProviderDetail(
     val ollamaBlocked =
         descriptor.id == ProviderRegistry.OLLAMA && state.ollamaSystemInfo?.meetsMinimum == false
 
+    val revealEditor = remember(descriptor.id) { BringIntoViewRequester() }
+    var editorPlaced by remember(descriptor.id) { mutableStateOf(false) }
+    LaunchedEffect(descriptor.id, editorPlaced) {
+        if (editorPlaced) revealEditor.bringIntoView()
+    }
+
     // One card for the whole editor — title through the activate button — rather than two
     // separate cards (key section, model section) with a header floating above both. Add and
     // edit are the same form, so there is exactly one boundary to open and close.
-    BossCard(modifier = Modifier.fillMaxWidth()) {
+    BossCard(modifier = Modifier.fillMaxWidth()
+        .bringIntoViewRequester(revealEditor)
+        .onGloballyPositioned { editorPlaced = true }) {
         Column(
             modifier = Modifier.padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = descriptor.displayName,
-                    style = SecretPanelType.bodyStrong,
-                    color = BossThemeColors.TextPrimary,
-                    modifier = Modifier.weight(1f),
-                )
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End) {
+                if (showTitle) {
+                    Text(
+                        text = descriptor.displayName,
+                        style = SecretPanelType.bodyStrong,
+                        color = BossThemeColors.TextPrimary,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
                 BossSecondaryButton(text = "Cancel", onClick = onCancel, enabled = !busy)
             }
 

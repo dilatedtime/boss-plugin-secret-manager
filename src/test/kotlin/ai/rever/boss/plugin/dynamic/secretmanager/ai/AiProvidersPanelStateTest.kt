@@ -9,6 +9,9 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -46,16 +49,27 @@ class AiProvidersPanelStateTest {
         pullBody: String = """{"status":"success"}""",
         catalogBody: String = """{"data":[{"id":"llama3.2:3b"}]}""",
         ollamaInstalled: Boolean = true,
+        onRequest: (java.net.http.HttpRequest) -> Unit = {},
+        root: File = tempDir("panel-state"),
+        initialEnv: String = "",
+        legacyFile: File? = null,
+        secrets: FakeSecretDataProvider = FakeSecretDataProvider(emptyList()),
+        isOllamaInstalled: () -> Boolean = { ollamaInstalled },
     ): AiProvidersViewModel {
-        val root = tempDir("panel-state")
         val env = envIn(root)
+        File(root, "env_vars").writeText(initialEnv)
+        val store = ProviderCredentialStore(secrets, env)
         val scope = CoroutineScope(Dispatchers.Default + SupervisorJob()).also { scopes.add(it) }
-        val http = FakeStreamingHttpClient(pullBody = pullBody, catalogBody = catalogBody)
+        val http = FakeStreamingHttpClient(pullBody = pullBody, catalogBody = catalogBody, onRequest = onRequest)
         return AiProvidersViewModel(
-            store = ProviderCredentialStore(FakeSecretDataProvider(emptyList()), env),
+            store = store,
             catalog = ModelCatalog(client = ModelCatalogClient(http), cacheDir = tempDir("panel-state-catalog")),
             prefs = ActiveProviderPrefs(bossRootDir = root),
-            legacyImport = null,
+            legacyImport = legacyFile?.let { file ->
+                LegacySettingsImport(store, env, root, sources = listOf(
+                    LegacySettingsImport.LegacySource(file) { mapOf("OPENAI" to "legacy-test-key") },
+                ))
+            },
             splitViewOperations = null,
             scope = scope,
             envResolver = env,
@@ -64,7 +78,7 @@ class AiProvidersPanelStateTest {
                     path = "",
                     home = "",
                     isWindows = false,
-                    isExecutable = { ollamaInstalled },
+                    isExecutable = { isOllamaInstalled() },
                     physicalMemoryBytes = { SIXTEEN_GB },
                     browse = { false },
                 ),
@@ -74,8 +88,7 @@ class AiProvidersPanelStateTest {
 
     /** `load()` launches; this waits for the pass that clears `isLoading` to have finished. */
     private suspend fun AiProvidersViewModel.loaded() {
-        load()
-        withTimeout(TIMEOUT_MS) { state.first { !it.isLoading && it.ollamaSystemInfo != null } }
+        withTimeout(TIMEOUT_MS) { enterSection().join() }
     }
 
     @Test
@@ -87,12 +100,122 @@ class AiProvidersPanelStateTest {
         assertTrue(vm.state.value.isEditorOpen)
 
         // Leaving and re-entering the section is exactly this: the panel's LaunchedEffect
-        // calls load() again on the same instance.
+        // calls enterSection() again on the same instance.
         vm.loaded()
 
         assertFalse(vm.state.value.isEditorOpen, "a reload must not carry a previous visit's open card")
         // The *selection* is deliberately kept - reopening returns to the same provider.
         assertEquals(ProviderRegistry.ANTHROPIC, vm.state.value.selectedProviderId)
+    }
+
+    @Test
+    fun firstSectionEntryPreservesTheProviderOpenedFromASecretCard() = runBlocking {
+        val vm = viewModel()
+        assertTrue(vm.requestProviderOnEntry(ProviderRegistry.ANTHROPIC))
+        vm.loaded()
+
+        assertTrue(vm.state.value.isEditorOpen)
+        assertEquals(ProviderRegistry.ANTHROPIC, vm.state.value.selectedProviderId)
+        vm.loaded()
+        assertFalse(vm.state.value.isEditorOpen, "the navigation command is consumed once")
+    }
+
+    @Test
+    fun unknownProviderLinksDoNotOpenAnotherProvider() = runBlocking {
+        val vm = viewModel()
+        assertFalse(vm.requestProviderOnEntry("removed-provider"))
+        vm.loaded()
+        assertFalse(vm.state.value.isEditorOpen)
+        vm.selectProvider("removed-provider")
+        assertFalse(vm.state.value.isEditorOpen)
+        assertNotNull(vm.state.value.error)
+    }
+
+    @Test
+    fun clickingAnExpandedProviderClosesItAndDropsItsDraft() = runBlocking {
+        val vm = viewModel()
+        vm.loaded()
+        vm.toggleProvider(ProviderRegistry.ANTHROPIC)
+        assertTrue(vm.state.value.isEditorOpen)
+        vm.updateKeyDraft(ProviderRegistry.ANTHROPIC, "unsaved-test-key")
+        vm.toggleProvider(ProviderRegistry.ANTHROPIC)
+        assertFalse(vm.state.value.isEditorOpen)
+        assertNull(vm.state.value.keyDrafts[ProviderRegistry.ANTHROPIC])
+    }
+
+    @Test
+    fun sectionEntryReloadsEnvironmentAndOffersLegacyImport() = runBlocking {
+        val root = tempDir("entry-env")
+        val legacy = File(root, "legacy.json").also { it.writeText("legacy fixture") }
+        val vm = viewModel(root = root, initialEnv = "OPENAI_API_KEY=env-test-key", legacyFile = legacy)
+        vm.loaded()
+        assertEquals(CredentialSource.ENVIRONMENT, vm.state.value.connectionOf(ProviderRegistry.OPENAI).source)
+        File(root, "env_vars").writeText("")
+        vm.loaded()
+        assertEquals(CredentialSource.NONE, vm.state.value.connectionOf(ProviderRegistry.OPENAI).source)
+        assertNotNull(vm.state.value.legacyOffer)
+    }
+
+    @Test
+    fun refreshRereadsEnvironmentAndOllamaWithoutClosingTheEditor() = runBlocking {
+        val root = tempDir("refresh-local")
+        val installed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val vm = viewModel(root = root, initialEnv = "OPENAI_API_KEY=env-test-key", isOllamaInstalled = installed::get)
+        vm.loaded()
+        assertFalse(vm.state.value.ollamaSystemInfo!!.binaryFound)
+        vm.selectProvider(ProviderRegistry.OPENAI)
+        File(root, "env_vars").writeText("")
+        installed.set(true)
+        withTimeout(TIMEOUT_MS) { vm.refreshConnections().join() }
+        assertTrue(vm.state.value.ollamaSystemInfo!!.binaryFound)
+        assertEquals(CredentialSource.NONE, vm.state.value.connectionOf(ProviderRegistry.OPENAI).source)
+        assertTrue(vm.state.value.isEditorOpen)
+    }
+
+    @Test
+    fun coldRefreshPreservesTheOpenEditorAndDraft() = runBlocking {
+        val vm = viewModel()
+        assertFalse(vm.connectionsLoaded.value)
+        vm.selectProvider(ProviderRegistry.OPENAI)
+        vm.updateKeyDraft(ProviderRegistry.OPENAI, "unsaved-test-key")
+        withTimeout(TIMEOUT_MS) { vm.refreshConnections().join() }
+        assertTrue(vm.state.value.isEditorOpen)
+        assertEquals(ProviderRegistry.OPENAI, vm.state.value.selectedProviderId)
+        assertEquals("unsaved-test-key", vm.state.value.keyDrafts[ProviderRegistry.OPENAI])
+    }
+
+    @Test
+    fun dismissingLegacyImportLastsAcrossEntryAndRefresh() = runBlocking {
+        val root = tempDir("dismiss-legacy")
+        val file = File(root, "legacy.json").also { it.writeText("legacy fixture") }
+        val vm = viewModel(root = root, legacyFile = file)
+        vm.loaded()
+        assertNotNull(vm.state.value.legacyOffer)
+        vm.dismissLegacyOffer()
+        vm.loaded()
+        assertNull(vm.state.value.legacyOffer)
+        withTimeout(TIMEOUT_MS) { vm.refreshConnections().join() }
+        assertNull(vm.state.value.legacyOffer)
+        assertTrue(file.exists(), "dismissal does not retire unimported credentials")
+    }
+
+    @Test
+    fun refreshDiscoversANewlyInstalledDaemonWithoutCredentialChanges() = runBlocking {
+        val installed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val vm = viewModel(isOllamaInstalled = installed::get)
+        vm.loaded()
+        assertFalse(vm.state.value.catalogOf(ProviderRegistry.OLLAMA) is CatalogState.Loaded)
+        installed.set(true)
+        withTimeout(TIMEOUT_MS) { vm.refreshConnections().join() }
+        assertTrue(vm.state.value.catalogOf(ProviderRegistry.OLLAMA) is CatalogState.Loaded)
+    }
+
+    @Test
+    fun sectionEntryChecksLocalOllamaEvenWhenVaultReadsFail() = runBlocking {
+        val vm = viewModel(secrets = FakeSecretDataProvider(emptyList(), failReads = true))
+        vm.loaded()
+        assertFalse(vm.state.value.storeAvailable)
+        assertNotNull(vm.state.value.ollamaSystemInfo)
     }
 
     @Test
@@ -168,14 +291,32 @@ class AiProvidersPanelStateTest {
 
     @Test
     fun aSecondPullIsRefusedWhileTheFirstIsStillRunning() = runBlocking {
-        val vm = viewModel()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val pulls = AtomicInteger()
+        val vm = viewModel(onRequest = { request ->
+            if (request.uri().path == "/api/pull") {
+                pulls.incrementAndGet()
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+            }
+        })
         vm.loaded()
 
-        vm.installOllamaModel("llama3.2:3b")
-        // Synchronous with the call, so this observes the guard rather than racing it.
-        vm.installOllamaModel("mistral:7b")
+        try {
+            vm.installOllamaModel("llama3.2:3b")
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            // Hold the first request in flight: a fast fake could otherwise finish
+            // before the second click, making a second pull correct behavior.
+            vm.installOllamaModel("mistral:7b")
+        } finally {
+            release.countDown()
+        }
 
-        withTimeout(TIMEOUT_MS) { vm.state.first { it.notice != null } }
+        withTimeout(TIMEOUT_MS) {
+            vm.state.first { it.notice != null && it.installingOllamaModelTag == null }
+        }
+        assertEquals(1, pulls.get())
         assertEquals("Pulled llama3.2:3b.", vm.state.value.notice, "the second press must not have started a pull")
     }
 

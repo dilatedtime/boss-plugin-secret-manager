@@ -91,8 +91,9 @@ class ConsumerProviderDiscoveryTest {
         }, physicalMemoryBytes = { null }, browse = { false })
         Harness(keys = emptyMap(), probe = probe).use { h ->
             try {
-                assertTrue(entered.await(5, TimeUnit.SECONDS))
+                // The probe starts on the first consumer read, not ViewModel construction.
                 h.api.availableModels()
+                assertTrue(entered.await(5, TimeUnit.SECONDS))
                 withTimeout(5000) { h.vm.connectionsLoaded.first { it } }
                 assertNull(withTimeoutOrNull(100) { h.vm.catalogsLoaded.first { it } },
                     "catalog sweep must remain suspended while the probe is unresolved")

@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -173,6 +174,7 @@ private fun SecretManagerView(
     // other is on screen (and on every Refresh), so a state remembered down there would drop
     // the scroll position every time the user looks at the other tab and comes back.
     val sharedListState = rememberLazyListState()
+    val aiScrollState = rememberScrollState()
     val clipboardManager = LocalClipboardManager.current
     // Resolved here rather than at registration: see the parameter's own note. `remember` with no
     // key is right - the supplier reads a field that is set once, before any panel is created.
@@ -225,9 +227,8 @@ private fun SecretManagerView(
                             SecretPanelSection.SHARED_WITH_ME -> sharedSecretsViewModel.refresh()
                             SecretPanelSection.AI_PROVIDERS ->
                                 aiViewModel?.let {
-                                    // All three, because all three can go stale while the panel
-                                    // sits open: a key edited elsewhere, a gateway installed in
-                                    // the Toolbox, a CLI signed into in a terminal.
+                                    // Refresh credentials/environment/local Ollama, gateway presence,
+                                    // and CLI sessions independently while the panel stays open.
                                     it.refreshConnections()
                                     it.checkGateway()
                                     it.refreshCliEngines()
@@ -395,6 +396,13 @@ private fun SecretManagerView(
                         viewModel = viewModel,
                         listState = listState,
                         clipboardManager = clipboardManager,
+                        onOpenAiProvider = { providerId ->
+                            if (aiViewModel?.requestProviderOnEntry(providerId) == true) {
+                                onSelectSection(SecretPanelSection.AI_PROVIDERS)
+                            } else {
+                                viewModel.reportAiProviderUnavailable()
+                            }
+                        },
                         modifier = Modifier.weight(1f),
                     )
 
@@ -421,7 +429,7 @@ private fun SecretManagerView(
                     // Guarded anyway rather than asserted, because the day the tab is offered
                     // some other way, a blank section beats a crash inside a credentials panel.
                     aiViewModel?.let { model ->
-                        AiProvidersPanel(viewModel = model, modifier = Modifier.weight(1f))
+                        AiProvidersPanel(viewModel = model, modifier = Modifier.weight(1f), scrollState = aiScrollState)
                     }
             }
         }
@@ -533,6 +541,8 @@ private fun SecretsSection(
     viewModel: SecretManagerViewModel,
     listState: LazyListState,
     clipboardManager: ClipboardManager,
+    /** Reveal a provider in the AI section. Given its id, which is the secret's `website`. */
+    onOpenAiProvider: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val state = viewModel.state
@@ -598,7 +608,9 @@ private fun SecretsSection(
                             onCopyPassword = { viewModel.copyPasswordToClipboard(secret, clipboardManager) },
                             isAiProvider = viewModel.isAiProviderSecret(secret),
                             aiProviderLabel = viewModel.aiProviderDisplayName(secret),
-                            onOpenAiProviderSettings = { viewModel.openAiProviderSettings() }
+                            // `website` holds the provider id, which is what makes this land on
+                            // the right row rather than at the top of the list.
+                            onOpenAiProviderSettings = { onOpenAiProvider(viewModel.aiProviderId(secret).orEmpty()) }
                         )
                     }
 
@@ -950,8 +962,10 @@ private fun SecretCard(
 
     BossCard(modifier = Modifier.fillMaxWidth()) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            // AI provider entries are configuration, not a password: the useful action is
-            // to open the settings section where the key can be tested and a model picked.
+            // AI provider entries are configuration, not a password: the useful action is to
+            // open the place where the key can be tested and a model picked. That used to be the
+            // host's Settings window, two clicks and a different window away from the vault the
+            // key is stored in; it is now the AI tab of this panel, with this provider selected.
             if (isAiProvider) {
                 Row(
                     modifier = Modifier
@@ -976,7 +990,7 @@ private fun SecretCard(
                         modifier = Modifier.weight(1f)
                     )
                     Text(
-                        text = "Open settings →",
+                        text = "Open →",
                         color = BossThemeColors.AccentColor,
                         style = SecretPanelType.meta
                     )

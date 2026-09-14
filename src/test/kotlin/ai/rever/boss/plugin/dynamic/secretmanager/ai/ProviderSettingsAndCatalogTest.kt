@@ -358,6 +358,13 @@ class ModelCatalogStateTest {
  */
 class ProviderRegistryTest {
     @Test
+    fun storedProviderResolutionUsesWebsiteThenKnownTagAndRejectsUnknownIds() {
+        assertEquals(ProviderRegistry.OPENAI, ProviderRegistry.storedProviderId("edited-website", listOf("ai-provider", ProviderRegistry.OPENAI)))
+        assertEquals(ProviderRegistry.ANTHROPIC, ProviderRegistry.storedProviderId(ProviderRegistry.ANTHROPIC, listOf(ProviderRegistry.OPENAI)))
+        assertNull(ProviderRegistry.storedProviderId("removed", listOf("ai-provider")))
+    }
+
+    @Test
     fun `ids are unique`() {
         val ids = ProviderRegistry.all.map { it.id }
         assertEquals(ids.size, ids.distinct().size, "duplicate provider ids: $ids")

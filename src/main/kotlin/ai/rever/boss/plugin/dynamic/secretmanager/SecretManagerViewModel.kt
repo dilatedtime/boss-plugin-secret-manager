@@ -34,11 +34,6 @@ private const val CLIPBOARD_CLEAR_DELAY_MS = 45_000L
 // (migration 20260809000000). Held by admin and boss_admin, not by `user`.
 internal const val PERMISSION_SHARE_WITH_ROLE = "secret.share.role"
 
-// The host's SettingsSection enum entry for AI provider settings. Matched
-// case-insensitively by the host, and still named LLM_PROVIDERS for compatibility
-// even though the section now displays as "AI Providers".
-private const val AI_PROVIDERS_SETTINGS_SECTION = "LLM_PROVIDERS"
-
 @Serializable
 data class ShareUserRow(val id: String, val email: String)
 
@@ -58,9 +53,6 @@ class SecretManagerViewModel(
     private val scope: CoroutineScope,
     /** Writes AI provider keys through the same store the AI Providers panel uses. */
     private val aiProviderStore: ProviderCredentialStore? = null,
-    /** Used to jump to Settings → AI Providers from an AI provider entry. */
-    private val settingsProvider: SettingsProvider? = null,
-    private val windowId: String? = null,
     /** Opens a provider's key console, same affordance as the AI Providers panel. */
     private val splitViewOperations: SplitViewOperations? = null,
     /** Read-only: decides whether the share dialog offers role targets at all. */
@@ -399,9 +391,12 @@ class SecretManagerViewModel(
     fun isAiProviderSecret(secret: SecretEntryData): Boolean =
         secret.tags.contains(ProviderCredentialStore.TAG_AI_PROVIDER)
 
+    fun aiProviderId(secret: SecretEntryData): String? =
+        ProviderRegistry.storedProviderId(secret.website, secret.tags)
+
     /** Display name for an AI provider entry, falling back to the stored website value. */
     fun aiProviderDisplayName(secret: SecretEntryData): String =
-        ProviderRegistry.find(secret.website)?.displayName ?: secret.website
+        aiProviderId(secret)?.let(ProviderRegistry::find)?.displayName ?: secret.website
 
     /**
      * Open the provider-key dialog, then load which providers already have a credential.
@@ -577,32 +572,6 @@ class SecretManagerViewModel(
         }
     }
 
-    /**
-     * Open Settings → AI Providers, where the key can be tested and a model chosen.
-     *
-     * The section name is the host's `SettingsSection` enum entry; the host matches it
-     * case-insensitively.
-     */
-    fun openAiProviderSettings() {
-        val provider = settingsProvider
-        val window = windowId
-        if (provider == null || window == null) {
-            state = state.copy(
-                errorMessage = "Open Settings → AI Providers to manage this key."
-            )
-            return
-        }
-        runCatching { provider.openSettings(window, AI_PROVIDERS_SETTINGS_SECTION) }
-            .onFailure {
-                logger.warn(
-                    LogCategory.GENERAL,
-                    "Could not open AI provider settings",
-                    mapOf("exception" to (it::class.simpleName ?: "Exception"))
-                )
-                state = state.copy(errorMessage = "Open Settings → AI Providers to manage this key.")
-            }
-    }
-
     fun showShareDialog(secret: SecretEntryData) {
         state = state.copy(
             showShareDialog = true,
@@ -758,6 +727,10 @@ class SecretManagerViewModel(
         } else {
             state.copy(expandedSecretIds = current + secretId)
         }
+    }
+
+    fun reportAiProviderUnavailable() {
+        state = state.copy(errorMessage = "This AI provider is unavailable. Refresh or check that AI support is loaded.")
     }
 
     fun clearError() {

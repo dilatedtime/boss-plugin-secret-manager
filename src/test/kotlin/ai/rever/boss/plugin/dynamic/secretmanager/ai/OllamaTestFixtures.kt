@@ -3,8 +3,8 @@ package ai.rever.boss.plugin.dynamic.secretmanager.ai
 /**
  * A machine with no Ollama on it, built entirely from injected answers.
  *
- * Every `AiProvidersViewModel` a test constructs needs one. `init` calls
- * `refreshOllamaSystemInfo()`, so the default `OllamaSystemCheck()` would read the real
+ * Every `AiProvidersViewModel` a test constructs needs one. Panel entry and
+ * consumer catalog discovery probe the machine, so the default `OllamaSystemCheck()` would read the real
  * `PATH`, the real `user.home` and the real JMX bean — which is how a suite whose whole
  * point is "every source of variables is injected" quietly stops being hermetic, and
  * whose result then depends on whether the machine running it happens to have Ollama.
