@@ -54,6 +54,7 @@ class AiProvidersPanelStateTest {
         initialEnv: String = "",
         legacyFile: File? = null,
         secrets: FakeSecretDataProvider = FakeSecretDataProvider(emptyList()),
+        isOllamaInstalled: () -> Boolean = { ollamaInstalled },
     ): AiProvidersViewModel {
         val env = envIn(root)
         File(root, "env_vars").writeText(initialEnv)
@@ -77,7 +78,7 @@ class AiProvidersPanelStateTest {
                     path = "",
                     home = "",
                     isWindows = false,
-                    isExecutable = { ollamaInstalled },
+                    isExecutable = { isOllamaInstalled() },
                     physicalMemoryBytes = { SIXTEEN_GB },
                     browse = { false },
                 ),
@@ -153,6 +154,22 @@ class AiProvidersPanelStateTest {
         vm.loaded()
         assertEquals(CredentialSource.NONE, vm.state.value.connectionOf(ProviderRegistry.OPENAI).source)
         assertNotNull(vm.state.value.legacyOffer)
+    }
+
+    @Test
+    fun refreshRereadsEnvironmentAndOllamaWithoutClosingTheEditor() = runBlocking {
+        val root = tempDir("refresh-local")
+        val installed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val vm = viewModel(root = root, initialEnv = "OPENAI_API_KEY=env-test-key", isOllamaInstalled = installed::get)
+        vm.loaded()
+        assertFalse(vm.state.value.ollamaSystemInfo!!.binaryFound)
+        vm.selectProvider(ProviderRegistry.OPENAI)
+        File(root, "env_vars").writeText("")
+        installed.set(true)
+        withTimeout(TIMEOUT_MS) { vm.refreshConnections().join() }
+        assertTrue(vm.state.value.ollamaSystemInfo!!.binaryFound)
+        assertEquals(CredentialSource.NONE, vm.state.value.connectionOf(ProviderRegistry.OPENAI).source)
+        assertTrue(vm.state.value.isEditorOpen)
     }
 
     @Test

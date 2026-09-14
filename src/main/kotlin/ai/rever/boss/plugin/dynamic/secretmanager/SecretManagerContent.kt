@@ -173,6 +173,7 @@ private fun SecretManagerView(
     // other is on screen (and on every Refresh), so a state remembered down there would drop
     // the scroll position every time the user looks at the other tab and comes back.
     val sharedListState = rememberLazyListState()
+    val aiScrollState = rememberScrollState()
     val clipboardManager = LocalClipboardManager.current
     // Resolved here rather than at registration: see the parameter's own note. `remember` with no
     // key is right - the supplier reads a field that is set once, before any panel is created.
@@ -225,9 +226,8 @@ private fun SecretManagerView(
                             SecretPanelSection.SHARED_WITH_ME -> sharedSecretsViewModel.refresh()
                             SecretPanelSection.AI_PROVIDERS ->
                                 aiViewModel?.let {
-                                    // All three, because all three can go stale while the panel
-                                    // sits open: a key edited elsewhere, a gateway installed in
-                                    // the Toolbox, a CLI signed into in a terminal.
+                                    // Refresh credentials/environment/local Ollama, gateway presence,
+                                    // and CLI sessions independently while the panel stays open.
                                     it.refreshConnections()
                                     it.checkGateway()
                                     it.refreshCliEngines()
@@ -428,7 +428,7 @@ private fun SecretManagerView(
                     // Guarded anyway rather than asserted, because the day the tab is offered
                     // some other way, a blank section beats a crash inside a credentials panel.
                     aiViewModel?.let { model ->
-                        AiProvidersPanel(viewModel = model, modifier = Modifier.weight(1f))
+                        AiProvidersPanel(viewModel = model, modifier = Modifier.weight(1f), scrollState = aiScrollState)
                     }
             }
         }
@@ -609,7 +609,7 @@ private fun SecretsSection(
                             aiProviderLabel = viewModel.aiProviderDisplayName(secret),
                             // `website` holds the provider id, which is what makes this land on
                             // the right row rather than at the top of the list.
-                            onOpenAiProviderSettings = { onOpenAiProvider(secret.website) }
+                            onOpenAiProviderSettings = { onOpenAiProvider(viewModel.aiProviderId(secret).orEmpty()) }
                         )
                     }
 

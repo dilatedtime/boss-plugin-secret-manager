@@ -7,6 +7,7 @@ import ai.rever.boss.plugin.ui.BossSecondaryButton
 import ai.rever.boss.plugin.ui.BossSection
 import ai.rever.boss.plugin.ui.BossTextField
 import ai.rever.boss.plugin.ui.BossThemeColors
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -66,6 +67,7 @@ import kotlin.math.roundToInt
 fun AiProvidersPanel(
     viewModel: AiProvidersViewModel,
     modifier: Modifier = Modifier,
+    scrollState: ScrollState = rememberScrollState(),
 ) {
     LaunchedEffect(viewModel) { viewModel.enterSection() }
     val state by viewModel.state.collectAsState()
@@ -79,7 +81,7 @@ fun AiProvidersPanel(
         modifier =
             modifier
                 .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scrollState)
                 .padding(vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {

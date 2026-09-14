@@ -762,7 +762,7 @@ class AiProvidersViewModel(
      */
     fun checkGateway() {
         val presence = gateway ?: return
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             val notice = runCatching { presence.notice() }.getOrDefault(GatewayNotice.NONE)
             _state.update { it.copy(gatewayNotice = notice) }
         }
@@ -775,11 +775,6 @@ class AiProvidersViewModel(
      * stats) and a JMX bean, and `pluginScope` falls back to `Dispatchers.Main` — neither
      * should ever be a reason a panel entry blocks on disk access.
      */
-    fun refreshOllamaSystemInfo() {
-        scope.launch { readOllamaSystemInfo() }
-    }
-
-    /** [refreshOllamaSystemInfo]'s body, awaitable by a caller whose next step depends on it. */
     private suspend fun readOllamaSystemInfo() {
         val info =
             withContext(Dispatchers.IO) {
@@ -901,7 +896,7 @@ class AiProvidersViewModel(
 
     fun refreshCliEngines() {
         val access = cliEngines ?: return
-        scope.launch {
+        scope.launch(Dispatchers.IO) {
             val engines = runCatching { access.engines() }.getOrDefault(emptyList())
             val selected = runCatching { access.selectedEngineId() }.getOrNull()
             _state.update { it.copy(cliEngines = engines, activeCliEngineId = selected) }
@@ -1251,7 +1246,14 @@ class AiProvidersViewModel(
      */
     fun refreshConnections(): Job = scope.launch(Dispatchers.IO) {
         store?.expireSharedDefinitions()
-        if (!_connectionsLoaded.value) load().join() else reloadConnectionsSafely()
+        if (!_connectionsLoaded.value) {
+            load().join()
+        } else {
+            envResolver.invalidate()
+            readOllamaSystemInfo()
+            checkLegacyImport()
+            reloadConnectionsSafely()
+        }
     }
 
     private suspend fun reloadConnectionsSafely() {

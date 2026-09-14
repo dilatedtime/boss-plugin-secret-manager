@@ -56,12 +56,11 @@ class CliEngineSelectionTest {
             private set
 
         /** Counted so a test can assert the probes have *not* run yet. */
-        @Volatile
-        var engineListReads: Int = 0
-            private set
+        private val reads = java.util.concurrent.atomic.AtomicInteger()
+        val engineListReads: Int get() = reads.get()
 
         override fun engines(): List<CliEngineInfo> {
-            engineListReads++
+            reads.incrementAndGet()
             return engines
         }
 

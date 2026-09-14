@@ -391,9 +391,12 @@ class SecretManagerViewModel(
     fun isAiProviderSecret(secret: SecretEntryData): Boolean =
         secret.tags.contains(ProviderCredentialStore.TAG_AI_PROVIDER)
 
+    fun aiProviderId(secret: SecretEntryData): String? =
+        ProviderRegistry.storedProviderId(secret.website, secret.tags)
+
     /** Display name for an AI provider entry, falling back to the stored website value. */
     fun aiProviderDisplayName(secret: SecretEntryData): String =
-        ProviderRegistry.find(secret.website)?.displayName ?: secret.website
+        aiProviderId(secret)?.let(ProviderRegistry::find)?.displayName ?: secret.website
 
     /**
      * Open the provider-key dialog, then load which providers already have a credential.

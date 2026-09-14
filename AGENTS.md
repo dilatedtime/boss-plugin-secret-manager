@@ -314,9 +314,10 @@ why `gatewayNotice` starts at `NONE` rather than at a "checking" state: a sectio
 "install the gateway" for one frame on every open, for the many users who have it, is a worse lie
 than a notice that appears late for the few who do not.
 
-**Refresh means three things in this section.** `refreshConnections()`, `checkGateway()` and
-`refreshCliEngines()`, because all three can go stale while the panel sits open: a key edited in the
-Secrets section next door, a gateway installed in the Toolbox, a CLI signed into in a terminal.
+**Refresh rereads all setup sources.** `refreshConnections()` refreshes environment variables,
+local Ollama presence, legacy import offers and credentials without closing the editor.
+`checkGateway()` and `refreshCliEngines()` also run, since gateway installation and CLI login can
+change while the panel sits open. Registry and engine health work launches on IO.
 `refreshConnections` had to be added - `ensureConnectionsLoaded` is `compareAndSet(false, true)` and
 loads once per ViewModel, so it is not a refresh.
 
@@ -375,6 +376,11 @@ call `SettingsProvider.openSettings(window, "LLM_PROVIDERS")`; it now selects th
 switches the panel's section. `secret.website` holds the provider id, which is what makes it land on
 the right row rather than at the top of the list. `settingsProvider` and `windowId` were removed
 from `SecretManagerViewModel` with it - that jump was their only reader.
+
+Navigation resolves the website first and then known provider tags through the same resolver as
+credential storage. Edited metadata must not send a key into a different provider's form.
+Unknown providers and unavailable AI support show an error in Secrets. The AI scroll state stays
+hoisted alongside the two secret lists so a tab switch does not discard the reader's place.
 
 ### The section loads lazily, because `init` is `register()`
 
