@@ -127,7 +127,7 @@ class OllamaSystemCheckTest {
         custom.current()
 
         assertTrue(
-            checked.any { it.path == "/home/test/.ollama/bin/ollama" },
+            checked.any { it == File("/home/test", ".ollama/bin/ollama") },
             "expected an expanded ~/.ollama/bin candidate, saw: $checked",
         )
     }

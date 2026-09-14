@@ -60,7 +60,7 @@ repositories {
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo.
-        // plugin.json declares apiVersion and minApiVersion 1.0.90. The core panel directly
+        // plugin.json declares apiVersion and minApiVersion 1.0.91. The core panel directly
         // references SecretEntryWithAccessData and the access-aware provider methods introduced
         // there, so a construction-time LinkageError guard cannot make an older host safe.
         // See AGENTS.md "Linkage containment".
