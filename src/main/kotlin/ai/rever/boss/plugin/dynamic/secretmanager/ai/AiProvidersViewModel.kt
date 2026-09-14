@@ -434,6 +434,9 @@ class AiProvidersViewModel(
                     .forEach { catalog.markNotConfigured(it.id) }
             }
             connectionGeneration = startedAt
+            // Selection is a cheap preference read; engine enumeration/health stays lazy.
+            // Consumer discovery must respect a CLI selected before this panel opens.
+            val selectedCli = runCatching { cliEngines?.selectedEngineId() }.getOrNull()
 
             _state.update { current ->
                 val preferred = current.activeProviderId ?: storedActive
@@ -446,6 +449,8 @@ class AiProvidersViewModel(
                     activeProviderId = if (snapshot?.sharedDiscoveryComplete == false &&
                         preferred?.let(::isManagedProvider) == true) {
                         preferred
+                    } else if (preferred == null && selectedCli != null) {
+                        null
                     } else initialProviderId(preferred, descriptors, connections),
                     storeAvailable = store != null && snapshot?.storeReadFailed != true,
                     sharedDiscoveryWarning = snapshot?.sharedDiscoveryWarning,
@@ -1261,6 +1266,7 @@ class AiProvidersViewModel(
         connectionGeneration = startedAt
         val removed = previous.keys - preferredConnections.keys
         val savedActive = prefs.read()
+        val selectedCli = runCatching { cliEngines?.selectedEngineId() }.getOrNull()
         removed.forEach(catalog::markNotConfigured)
         _state.update { current ->
             val activeRemoved = reloaded.sharedDiscoveryComplete &&
@@ -1270,7 +1276,7 @@ class AiProvidersViewModel(
                 connections = preferredConnections,
                 providers = nextDescriptors.values.toList(),
                 activeProviderId = current.activeProviderId?.takeUnless { activeRemoved }
-                    ?: if (!activeRemoved && savedActive == null && current.activeCliEngineId == null) {
+                    ?: if (!activeRemoved && savedActive == null && current.activeCliEngineId == null && selectedCli == null) {
                         nextDescriptors[BossAiDiscovery.PROVIDER_ID]?.takeIf {
                             it.sharedDefault && preferredConnections[it.id]?.isConfigured == true
                         }?.id

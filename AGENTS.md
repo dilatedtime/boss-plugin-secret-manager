@@ -394,6 +394,11 @@ opened*, which counts engine-list reads rather than watching state, so a probe t
 slowly still fails it. `openingTheSectionTwiceProbesOnce` pins the idempotence the panel relies on,
 since it calls `ensureSectionLoaded()` from a `LaunchedEffect` on every entry.
 
+Consumer discovery still reads the selected CLI id (a preference, without enumerating engines or
+running health probes) before choosing an automatic HTTP default. The panel's `activeCliEngineId`
+is populated only on entry now, so trusting it during startup or sign-in recovery would silently
+select BOSS AI over an existing CLI choice. `BossAiDiscoveryTest` covers both paths before panel entry.
+
 ### The provider list is an accordion
 
 The selected provider's detail renders **under its own row**, inside the same section. It used to be
