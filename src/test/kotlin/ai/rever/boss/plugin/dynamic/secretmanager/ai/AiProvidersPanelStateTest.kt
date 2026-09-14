@@ -9,6 +9,9 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -46,11 +49,12 @@ class AiProvidersPanelStateTest {
         pullBody: String = """{"status":"success"}""",
         catalogBody: String = """{"data":[{"id":"llama3.2:3b"}]}""",
         ollamaInstalled: Boolean = true,
+        onRequest: (java.net.http.HttpRequest) -> Unit = {},
     ): AiProvidersViewModel {
         val root = tempDir("panel-state")
         val env = envIn(root)
         val scope = CoroutineScope(Dispatchers.Default + SupervisorJob()).also { scopes.add(it) }
-        val http = FakeStreamingHttpClient(pullBody = pullBody, catalogBody = catalogBody)
+        val http = FakeStreamingHttpClient(pullBody = pullBody, catalogBody = catalogBody, onRequest = onRequest)
         return AiProvidersViewModel(
             store = ProviderCredentialStore(FakeSecretDataProvider(emptyList()), env),
             catalog = ModelCatalog(client = ModelCatalogClient(http), cacheDir = tempDir("panel-state-catalog")),
@@ -74,8 +78,7 @@ class AiProvidersPanelStateTest {
 
     /** `load()` launches; this waits for the pass that clears `isLoading` to have finished. */
     private suspend fun AiProvidersViewModel.loaded() {
-        load()
-        withTimeout(TIMEOUT_MS) { state.first { !it.isLoading && it.ollamaSystemInfo != null } }
+        withTimeout(TIMEOUT_MS) { load().join() }
     }
 
     @Test
@@ -183,14 +186,32 @@ class AiProvidersPanelStateTest {
 
     @Test
     fun aSecondPullIsRefusedWhileTheFirstIsStillRunning() = runBlocking {
-        val vm = viewModel()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val pulls = AtomicInteger()
+        val vm = viewModel(onRequest = { request ->
+            if (request.uri().path == "/api/pull") {
+                pulls.incrementAndGet()
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+            }
+        })
         vm.loaded()
 
-        vm.installOllamaModel("llama3.2:3b")
-        // Synchronous with the call, so this observes the guard rather than racing it.
-        vm.installOllamaModel("mistral:7b")
+        try {
+            vm.installOllamaModel("llama3.2:3b")
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            // Hold the first request in flight: a fast fake could otherwise finish
+            // before the second click, making a second pull correct behavior.
+            vm.installOllamaModel("mistral:7b")
+        } finally {
+            release.countDown()
+        }
 
-        withTimeout(TIMEOUT_MS) { vm.state.first { it.notice != null } }
+        withTimeout(TIMEOUT_MS) {
+            vm.state.first { it.notice != null && it.installingOllamaModelTag == null }
+        }
+        assertEquals(1, pulls.get())
         assertEquals("Pulled llama3.2:3b.", vm.state.value.notice, "the second press must not have started a pull")
     }
 
