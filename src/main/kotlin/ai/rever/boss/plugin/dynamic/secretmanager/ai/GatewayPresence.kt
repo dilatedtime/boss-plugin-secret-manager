@@ -71,7 +71,7 @@ internal fun gatewayNotice(
  *
  * Ported from `user-secret-list`'s `SecretManagerLink`, minus the part that does not apply here:
  * that plugin's floor is 1.0.20, so it had to probe reflectively for `openPanel` (api 1.0.57).
- * This plugin's floor is **1.0.73**, so `openPanel`, `PanelEventProvider`, `PanelId` and
+ * This plugin's floor is **1.0.89**, so `openPanel`, `PanelEventProvider`, `PanelId` and
  * `PluginLoaderDelegate` are all below it and are called straight. A guard there would be dead
  * code implying a risk that cannot occur.
  */

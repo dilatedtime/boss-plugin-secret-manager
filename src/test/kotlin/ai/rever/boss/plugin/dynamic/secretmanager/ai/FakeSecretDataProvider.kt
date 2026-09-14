@@ -9,6 +9,7 @@ import ai.rever.boss.plugin.api.SecretShareData
 import ai.rever.boss.plugin.api.ShareSecretRequestData
 import ai.rever.boss.plugin.api.UnshareSecretRequestData
 import ai.rever.boss.plugin.api.UpdateSecretRequestData
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Fake store: records writes and serves [entries] in pages, so paging and precedence are
@@ -20,14 +21,14 @@ import ai.rever.boss.plugin.api.UpdateSecretRequestData
  * write behaviour.
  */
 internal class FakeSecretDataProvider(
-    var entries: List<SecretEntryData>,
+    @Volatile var entries: List<SecretEntryData>,
     private val failReads: Boolean = false,
     private val failWrites: Boolean = false,
 ) : SecretDataProvider {
     val created = mutableListOf<CreateSecretRequestData>()
     val updated = mutableListOf<UpdateSecretRequestData>()
     val deleted = mutableListOf<String>()
-    val pageRequests = mutableListOf<Pair<Int, Int>>()
+    val pageRequests = CopyOnWriteArrayList<Pair<Int, Int>>()
 
     override suspend fun getUserSecrets(
         limit: Int,

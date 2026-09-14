@@ -4,8 +4,10 @@ import ai.rever.boss.plugin.api.CreateSecretRequestData
 import ai.rever.boss.plugin.api.SecretDataProvider
 import ai.rever.boss.plugin.api.SecretEntryData
 import ai.rever.boss.plugin.api.UpdateSecretRequestData
+import ai.rever.boss.plugin.dynamic.secretmanager.SecretAccess
 import ai.rever.boss.plugin.logging.BossLogger
 import ai.rever.boss.plugin.logging.LogCategory
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,6 +26,10 @@ import kotlinx.serialization.json.Json
 data class ConnectionsSnapshot(
     val connections: Map<String, ProviderConnection>,
     val storeReadFailed: Boolean,
+    val descriptors: List<ProviderDescriptor> = ProviderRegistry.all,
+    val sharedDiscoveryWarning: String? = null,
+    val sharedDiscoveryComplete: Boolean = true,
+    val invalidatedDuringLoad: Boolean = false,
 )
 
 /**
@@ -64,6 +70,8 @@ class ProviderCredentialStore(
      * to outwait it, which is how an untested guard ends up wrong.
      */
     private val mintRetryBackoffMs: Long = DEFAULT_MINT_RETRY_BACKOFF_MS,
+    private val monotonicNanos: () -> Long = System::nanoTime,
+    private val bossAiDiscovery: BossAiDiscovery = BossAiDiscovery(),
 ) {
     private val logger = BossLogger.forComponent("AiCredentialStore")
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
@@ -145,6 +153,73 @@ class ProviderCredentialStore(
     @Volatile
     private var cached: Map<String, StoredProvider>? = null
 
+    private data class SharedDefinitions(
+        val descriptors: List<ProviderDescriptor>,
+        val warning: String? = null,
+        val stored: Map<String, StoredProvider> = emptyMap(),
+        val removalAuthoritative: Boolean = true,
+        val usedSharingSnapshot: Boolean = false,
+    )
+
+    private data class CachedSharedDefinitions(
+        val result: Result<SharedDefinitions>,
+        val generation: Long,
+        val fetchedAtNanos: Long,
+    )
+
+    private val sharedMutex = Mutex()
+    @Volatile private var cachedShared: CachedSharedDefinitions? = null
+
+    private data class CachedBossAi(
+        val result: Result<ProviderDescriptor>,
+        val scope: String?,
+        val generation: Long,
+        val fetchedAtNanos: Long,
+    )
+    private val bossAiMutex = Mutex()
+    @Volatile private var cachedBossAi: CachedBossAi? = null
+
+    private suspend fun loadBossAi(): Result<ProviderDescriptor>? = bossAiMutex.withLock {
+        val broker = brokeredKeys?.takeIf { it.discoversBossAi } ?: return@withLock null
+        val startedAt = generation.get()
+        val scope = broker.bossAiScope()
+        cachedBossAi?.takeIf {
+            it.scope == scope && it.generation == startedAt && monotonicNanos() - it.fetchedAtNanos <
+                (if (it.result.isSuccess) SHARED_DISCOVERY_TTL_NANOS else SHARED_RETRY_NANOS)
+        }?.let { return@withLock it.result }
+        val result = when {
+            scope == null -> Result.failure(IllegalStateException("BOSS AI authentication is unavailable."))
+            !SharedProviderDefinition.withinScope(scope, scope) ->
+                Result.failure(IllegalStateException("BOSS AI is unavailable within its trusted API scope."))
+            else -> {
+                val token = resolveBrokered(BossAiDiscovery.BROKER_ID)
+                if (token.isBlank()) Result.failure(IllegalStateException("Sign in to BOSS and retry BOSS AI using Refresh."))
+                else bossAiDiscovery.fetch(scope, token)
+            }
+        }
+        if (generation.get() == startedAt) cachedBossAi = CachedBossAi(result, scope, startedAt, monotonicNanos())
+        result
+    }
+
+    /** A manual discovery refresh is not a sign-out and must not discard minted keys. */
+    suspend fun expireSharedDefinitions() {
+        sharedMutex.withLock { cachedShared = null }
+        bossAiMutex.withLock { cachedBossAi = null }
+    }
+
+    fun sharedDefinitionsStale(): Boolean {
+        if (brokeredKeys?.discoversBossAi == true) {
+            val cache = cachedBossAi
+            if (cache == null || cache.generation != generation.get() ||
+                monotonicNanos() - cache.fetchedAtNanos >=
+                (if (cache.result.isSuccess) SHARED_DISCOVERY_TTL_NANOS else SHARED_RETRY_NANOS)) return true
+        }
+        if (brokeredKeys?.canDiscoverSharedProviders() != true) return false
+        val cache = cachedShared ?: return true
+        val ttl = if (cache.result.isSuccess) SHARED_DISCOVERY_TTL_NANOS else SHARED_RETRY_NANOS
+        return cache.generation != generation.get() || monotonicNanos() - cache.fetchedAtNanos >= ttl
+    }
+
     /**
      * Bumped by every [invalidate]; a load only seats its result if the generation it
      * started in is still current.
@@ -171,6 +246,8 @@ class ProviderCredentialStore(
         // provider for the rest of the session — the exact thing invalidate() prevents.
         generation.incrementAndGet()
         cached = null
+        cachedShared = null
+        cachedBossAi = null
         // Brokered credentials go too. Sign-out is one of the things that invalidates,
         // and a credential minted for the previous session must not outlive it.
         brokeredCache.clear()
@@ -181,17 +258,144 @@ class ProviderCredentialStore(
 
     /** Read every provider's effective connection. */
     suspend fun loadAll(): ConnectionsSnapshot {
-        val storedResult = loadStoredSecrets()
+        val startedAt = generation.get()
+        val bossAi = loadBossAi()
+        val shared = loadSharedDefinitions()
+        // The sharing RPC is a superset of the owned-secret list. A successful shared
+        // scan therefore supplies both views and avoids a second full-vault traversal.
+        // On failure, fall back to the narrower API so personal credentials still work.
+        val storedResult = if (shared.getOrNull()?.usedSharingSnapshot == true) {
+            Result.success(shared.getOrThrow().stored)
+        } else {
+            loadStoredSecrets()
+        }
         val stored = storedResult.getOrElse { emptyMap() }
+        val automatic = if (bossAi != null) listOf(bossAi.getOrElse { BossAiDiscovery.unavailableDescriptor() })
+            else emptyList()
+        // A legacy shared BOSS definition must not duplicate the automatically discovered provider.
+        val sharedDescriptors = shared.getOrNull()?.descriptors.orEmpty().filterNot {
+            bossAi != null && it.brokerId == BossAiDiscovery.BROKER_ID
+        }
+        val descriptors = automatic + ProviderRegistry.all + sharedDescriptors
 
         val connections =
-            ProviderRegistry.all.associate { descriptor ->
-                descriptor.id to resolveConnection(descriptor, stored[descriptor.id])
+            descriptors.associate { descriptor ->
+                descriptor.id to if (descriptor.id == BossAiDiscovery.PROVIDER_ID && bossAi?.isSuccess != true) {
+                    ProviderConnection(descriptor.id, "", CredentialSource.NONE)
+                } else resolveConnection(descriptor, stored[descriptor.id])
             }
+
+        // Preserve the pre-existing direct-caller contract for static providers. The
+        // ViewModel's reload path additionally guards the whole snapshot against invalidation.
+        if (startedAt != generation.get()) return ConnectionsSnapshot(
+            connections = connections.filterKeys { !isManagedProvider(it) },
+            storeReadFailed = storedResult.isFailure,
+            invalidatedDuringLoad = true,
+            sharedDiscoveryComplete = false,
+        )
 
         return ConnectionsSnapshot(
             connections = connections,
             storeReadFailed = storedResult.isFailure,
+            descriptors = descriptors,
+            sharedDiscoveryComplete = shared.isSuccess && shared.getOrNull()?.removalAuthoritative == true,
+            sharedDiscoveryWarning = listOfNotNull(
+                bossAi?.exceptionOrNull()?.message,
+                if (shared.isFailure) "Shared AI providers could not be refreshed. Retry using Refresh."
+                else shared.getOrNull()?.warning,
+            ).takeIf { it.isNotEmpty() }?.joinToString(" "),
+        )
+    }
+
+    private suspend fun loadSharedDefinitions(): Result<SharedDefinitions> = sharedMutex.withLock {
+        val broker = brokeredKeys
+        if (broker?.canDiscoverSharedProviders() != true) {
+            return@withLock Result.success(SharedDefinitions(emptyList()))
+        }
+        val startedAt = generation.get()
+        cachedShared?.takeIf {
+            it.generation == startedAt && monotonicNanos() - it.fetchedAtNanos <
+                (if (it.result.isSuccess) SHARED_DISCOVERY_TTL_NANOS else SHARED_RETRY_NANOS)
+        }?.let { return@withLock it.result }
+        val result = try {
+            Result.success(scanSharedDefinitions(broker))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Result.failure(error)
+        }
+        if (generation.get() == startedAt) {
+            cachedShared = CachedSharedDefinitions(result, startedAt, monotonicNanos())
+            result.getOrNull()?.let { cached = it.stored }
+        }
+        result
+    }
+
+    private suspend fun scanSharedDefinitions(broker: BrokeredKeySource): SharedDefinitions {
+        val found = mutableMapOf<String, ProviderDescriptor>()
+        val stored = mutableMapOf<String, StoredProvider>()
+        var offset = 0
+        var warning: String? = null
+        var removalAuthoritative = true
+        while (true) {
+            val page = secrets.getUserSecretsWithSharingInfo(limit = PAGE_SIZE, offset = offset).getOrThrow()
+            for (entry in page.data) {
+                if ((entry.accessLevel.equals(SecretAccess.OWNER, ignoreCase = true) ||
+                        entry.accessLevel.equals(SecretAccess.ORG, ignoreCase = true)) &&
+                    entry.tags.contains(TAG_AI_PROVIDER)) {
+                    val providerId = providerIdOf(entry.website, entry.tags) ?: continue
+                    stored.putIfAbsent(
+                        providerId,
+                        toStored(providerId, entry.id, entry.password, entry.username, entry.notes),
+                    )
+                }
+                if (!entry.tags.contains(SharedProviderDefinition.TAG)) continue
+                val definition = SharedProviderDefinition.parse(entry.notes) ?: continue
+                val sharedBy = entry.sharedByEmail?.filterNot(Char::isISOControl)?.trim()?.take(100)
+                val provenance = when {
+                    entry.accessLevel.equals(SecretAccess.OWNER, ignoreCase = true) -> SharedProviderProvenance.OWNED
+                    entry.accessLevel.equals(SecretAccess.ORG, ignoreCase = true) -> SharedProviderProvenance.ORGANISATION
+                    else -> SharedProviderProvenance.DIRECT_SHARE
+                }
+                val source = when (provenance) {
+                    SharedProviderProvenance.OWNED -> "Managed from your vault"
+                    SharedProviderProvenance.ORGANISATION -> "Managed by your organisation"
+                    SharedProviderProvenance.DIRECT_SHARE ->
+                        if (sharedBy.isNullOrBlank()) "Shared with you" else "Shared by $sharedBy"
+                }
+                val descriptor = definition.descriptor(entry.id, source, provenance)
+                val modelsEndpoint = descriptor.modelsEndpoint ?: continue
+                if (!broker.permitsEndpoints(
+                        definition.brokerId,
+                        listOf(descriptor.chatEndpoint, modelsEndpoint),
+                    )) {
+                    // Scope refusal can mean an unavailable host broker, not vault revocation.
+                    // Omit credentials, but do not clear the user's selected id based on this scan.
+                    warning = "Some shared AI definitions are unavailable within this host's broker scopes."
+                    removalAuthoritative = false
+                    continue
+                }
+                found.putIfAbsent(descriptor.id, descriptor)
+            }
+            if (!page.hasMore || page.data.isEmpty()) break
+            offset += page.data.size
+            if (offset >= MAX_SCANNED) {
+                warning = "Shared AI discovery reached its scan limit; some providers may not be listed."
+                removalAuthoritative = false
+                logger.warn(LogCategory.NETWORK, warning)
+                break
+            }
+        }
+        if (found.size > MAX_SHARED_PROVIDERS) {
+            warning = "Shared AI discovery reached its provider limit; some providers may not be listed."
+        }
+        return SharedDefinitions(
+            descriptors = found.values.sortedBy { it.id }.take(MAX_SHARED_PROVIDERS),
+            warning = warning,
+            stored = stored.toMap(),
+            // A provider over the admission cap is unavailable by policy, not unknown.
+            removalAuthoritative = removalAuthoritative,
+            usedSharingSnapshot = true,
         )
     }
 
@@ -429,8 +633,14 @@ class ProviderCredentialStore(
         // invalidation.
         val startedAt = generation.get()
 
-        return source
-            .fetch(brokerId)
+        val fetched = try {
+            source.fetch(brokerId)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Result.failure(error)
+        }
+        return fetched
             .fold(
                 onSuccess = { credential ->
                     lastMintFailureNanos.remove(brokerId)
@@ -657,20 +867,30 @@ class ProviderCredentialStore(
      * names a known provider, so an entry whose website was edited by hand still
      * resolves.
      */
-    private fun providerIdOf(entry: SecretEntryData): String? =
-        ProviderRegistry.find(entry.website)?.id
-            ?: entry.tags.firstNotNullOfOrNull { tag -> ProviderRegistry.find(tag)?.id }
+    private fun providerIdOf(entry: SecretEntryData): String? = providerIdOf(entry.website, entry.tags)
+
+    private fun providerIdOf(website: String, tags: List<String>): String? =
+        ProviderRegistry.find(website)?.id
+            ?: tags.firstNotNullOfOrNull { tag -> ProviderRegistry.find(tag)?.id }
 
     private fun toStored(
         providerId: String,
         entry: SecretEntryData,
+    ): StoredProvider = toStored(providerId, entry.id, entry.password, entry.username, entry.notes)
+
+    private fun toStored(
+        providerId: String,
+        secretId: String,
+        password: String,
+        username: String,
+        notes: String?,
     ): StoredProvider =
         StoredProvider(
-            secretId = entry.id,
+            secretId = secretId,
             providerId = providerId,
-            apiKey = entry.password,
-            label = entry.username.takeIf { it.isNotBlank() },
-            settings = parseSettings(entry.notes),
+            apiKey = password,
+            label = username.takeIf { it.isNotBlank() },
+            settings = parseSettings(notes),
         )
 
     /**
@@ -710,6 +930,9 @@ class ProviderCredentialStore(
 
         private const val PAGE_SIZE = 100
         private const val MAX_SCANNED = 2000
+        internal const val MAX_SHARED_PROVIDERS = 32
+        private const val SHARED_DISCOVERY_TTL_NANOS = 5 * 60 * 1_000_000_000L
+        private const val SHARED_RETRY_NANOS = 15 * 1_000_000_000L
         private const val MILLIS_PER_SECOND = 1000L
         private const val NANOS_PER_MILLI = 1_000_000L
 

@@ -8,7 +8,7 @@ Your credentials, secrets shared with you, Plugin Store API keys and AI provider
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.secretmanager`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.secretmanager.SecretManagerDynamicPlugin`
-- **API Version**: 1.0.73 (`plugin.json` `apiVersion` and `minApiVersion`)
+- **API Version**: 1.0.89 (`plugin.json` `apiVersion` and `minApiVersion`)
 
 ## Essential Commands
 
@@ -280,6 +280,15 @@ window away from the vault the keys are stored in.
 
 Four things about it that are easy to get wrong:
 
+**Cross-plugin navigation is a short-lived command, not durable state.** The event contract is
+`CustomPluginEvent(eventName = "secret-manager.open-ai", payload["windowId"] = <host window>)`.
+`ProviderNavigation` retains it because the click can beat panel construction, scopes it by window,
+and consumes it once. It expires after 30 seconds so opening the panel much later cannot jump the
+user for a forgotten click; a panel without an AI ViewModel consumes-and-declines it too. The event
+collector starts `UNDISPATCHED` only to establish the subscription before `register()` returns;
+unlike `checkGateway`, it performs no host registry or network work on that thread. Collection
+failures are contained because the shared plugin scope is not a supervisor.
+
 **The ViewModel arrives as a supplier, and the order forces that.** `AiProvidersViewModel` is built
 inside `registerAiProviderSettings`'s `LinkageError` guard - it starts a `catalog.states` collector,
 which on a host that cannot link `LlmProviderSettingsApiImpl` would be started and then orphaned -
@@ -295,9 +304,9 @@ the plugin's single instance, shared with the host's Settings window through
 `LlmProviderSettingsApiImpl`. Disposing it with the sidebar panel would take the host's AI Providers
 section down too.
 
-**The tab is absent, not disabled, when there is no ViewModel.** On a host whose api predates
-`LlmProviderSettingsAPI` (1.0.71) the section cannot render at all, and a tab whose only content is
-"not available here" is worse than one tab fewer. `showAiSection` is that check.
+**The tab is absent, not disabled, when there is no ViewModel.** Registration still contains an
+unexpected `LinkageError` so the secrets panel survives a malformed host API, and a tab whose only
+content is "not available here" is worse than one tab fewer. `showAiSection` is that check.
 
 **`checkGateway()` launches; it does not read the registry on the registration thread.** The work
 is one in-memory list read, but `getLoadedPlugins()` asks the plugin loader about its own registry
@@ -326,7 +335,7 @@ to discover that one plugin stood in the way.
 gateway serving no engines is a different fact from an absent one. It is ported from
 `user-secret-list`'s `SecretManagerLink` minus the part that does not apply: that plugin's floor is
 1.0.20, so it had to probe reflectively for `openPanel` (api 1.0.57). This plugin's floor is
-**1.0.73**, so `PluginLoaderDelegate`, `PanelEventProvider`, `PanelId` and `openPanel` are all below
+**1.0.89**, so `PluginLoaderDelegate`, `PanelEventProvider`, `PanelId` and `openPanel` are all below
 it and are called straight - a guard there would be dead code implying a risk that cannot occur.
 
 Two rules carried over from that port, both mutation-verified here:
@@ -376,7 +385,7 @@ ViewModel's `init`. This object is constructed during `register()`, on **every l
 section most launches never open - and `refreshCliEngines()` runs `<engine> --version`, so two
 engines meant two processes spawned during startup to fill in rows nobody had asked to see.
 
-`ensureConnectionsLoaded()` deliberately did **not** move. It is network-free, and other plugins read
+`ensureConnectionsLoaded()` deliberately did **not** move. Other plugins read
 `PluginContext.llmProvider` without this panel ever being opened, so the warm-up stays eager - it
 exists so the first AI action after a restart does not race the load.
 
@@ -401,11 +410,196 @@ that explains itself. Keep the fact a first-time reader cannot infer (a CLI logi
 providers below) and drop the instructions.
 
 
+### Automatic BOSS AI discovery
+
+BOSS AI is plugin-owned. `BossAiCredentialSource` uses the existing generic
+`SupabaseDataProvider.rpc("boss_ai_create_exchange_ticket")` to request an AI-only,
+single-use ticket for the authenticated user. It exchanges that ticket at the fixed
+BOSS AI `/auth/exchange` endpoint; no host broker registration, login-token exposure,
+or user-created vault entry is required. RISA GLM and optional legacy shares still
+use the host broker bridge.
+
+`BossAiDiscovery` reads authenticated `/v1/provider` metadata. The provider publishes
+its name, base URL and default recommendation; `/v1/models` publishes model names,
+capabilities, defaults, limits and allowances. The credential source owns the trusted
+bootstrap scope and rejects metadata outside it. HTTP redirects are not followed.
+`managed:boss-ai` is the stable provider id. Never write its credentials, metadata or
+account-specific catalog to disk; only explicit provider/model preferences persist.
+The managed-provider predicates include both this id and legacy `shared:` ids.
+
+Discovery failures keep a display-only BOSS AI row with a retry message, never a
+configured connection. Metadata caches are generation-scoped, expire after five minutes
+(or 15 seconds on failure), and are invalidated by sign-out and Refresh. Automatic
+BOSS AI suppresses duplicate legacy BOSS AI shares. A server-recommended default fills
+an absent preference, including recovery after initial authentication failure; it
+never overrides an explicit provider/model choice or an active CLI engine.
+The backend migration and function must be deployed, but no desktop host upgrade is
+required. `BossAiDiscoveryTest` covers the first consumer read with no host broker,
+a failed vault read, endpoint confinement, retry, local preference storage and
+credential/catalog disk isolation.
+
+### Legacy shared managed provider definitions
+
+Provider definitions tagged `ai-provider-definition` are discovered through
+`getUserSecretsWithSharingInfo`, including existing role and organisation shares.
+`SharedProviderDefinition` parses their versioned notes and derives stable provider
+ids from secret UUIDs. They are per-ViewModel descriptors, never mutations to the
+process-global `ProviderRegistry`. The owner controls the shared configuration;
+recipients keep model selections in local preferences and never write the share.
+
+Legacy definitions can still be published with the permission-checked
+`managed_ai_provider_publish` MCP tool. BOSS AI itself is automatic; its former
+"Add BOSS AI provider" vault action has been removed.
+
+The host broker owns the credential destination. Both catalog and inference URLs
+must fit its `BrokerInfo.scopedTo` boundary before minting. Shared definitions
+contain no upstream key; broker credentials stay in memory. Account-specific
+catalogs are not persisted. Discovery caches only descriptors (including an empty
+result) for five minutes, rechecking on the next credential reload after expiry;
+invalidation and the panel's Refresh clear it immediately. Refresh only expires
+the shared-definition cache, not minted credentials or the account generation.
+Failed scans retry no
+sooner than 15 seconds. A per-scan mutex coalesces renewals and a generation stamp
+prevents a pre-sign-out scan from repopulating the cache. No decrypted vault rows
+are retained by this cache. A capped scan retains the discovered prefix and shows
+a separate shared-discovery warning, never a false credential-storage failure.
+On a successful recheck,
+removal drops the connection and invalidates its catalog. Inference authorization
+is independently enforced by the server's live model permissions and allowances.
+
+The machine-facing listing predicate requires both a credential and a successfully
+fetched shared catalog. A transient catalog failure may reuse that same session's
+last-known list; 401/403 failures, missing credentials and missing initial catalogs
+remain unavailable. Metadata is not authorization: the broker enforces current
+model access on every inference request. The panel keeps an unavailable shared row visible
+so the user can check access. `activeConfig()` starts catalog discovery because
+shared model defaults cannot be resolved from a credential alone. Shared catalogs
+use `SHARED_CACHE_TTL_MS` (60 seconds); consumer polling can refresh them while the
+panel is closed, bounded by the existing 30-second sweep floor. This is intentional
+for changing allowances, not a vault rescan on every consumer read.
+
+Trust is attached to the host's broker scope, not to the note author's display
+name. Any readable definition, including a direct share, may name a trusted broker;
+names and default recommendations are publisher-supplied, not an official-identity
+badge. Role-wide publishing remains gated by the existing `secret.share.role` RPC.
+Deploy the official definition from an admin-owned entry. Neither `isOwner` nor
+`accessLevel` proves that another entry's author is an admin, so neither is used as
+a fabricated publisher-verification check.
+
+| Transition | What may change |
+|---|---|
+| First discovery with no saved or configured provider | Shared default recommendation may select a provider |
+| Existing explicit provider/model choice | Keep the user's preference |
+| Startup with a saved id absent from a complete discovery | Ignore the stale id for this session; prefer an existing configured provider |
+| Shared endpoint edited | Revalidate host scope and invalidate the catalog |
+| Complete scan proves the active share was removed | Clear active provider and catalog; ask the user to choose another, without silently rerouting |
+| Failed or capped scan omits the active share | Keep its selected id, fail closed without credentials, retry discovery on subsequent consumer reads |
+| Host scope cannot authorize a readable definition | Treat discovery as incomplete, withhold that credential, retain the selection for recovery |
+| Transient catalog failure after a successful fetch | Retain in-memory model choices; rejected credentials never use stale catalog fallback |
+| Account invalidated during discovery | Discard shared descriptors and credentials from that load |
+| Recipient selects a model | Write local prefs only; shared vault entry stays read-only |
+
+Review-round state rules: an incomplete or failed scan does not revoke the active
+selection; unavailable credentials fail closed while a later successful discovery
+restores the same selection. A generation-invalidated first load retries instead
+of reporting a vault outage. Manual discovery refresh does not invalidate session
+credentials. Exhausted startup retries report a retryable error and must not run
+an empty catalog sweep or publish readiness. Cancelled discovery is rethrown,
+never cached as a vault failure. Model-limit clamping is read-only; writers use raw connections.
+Successful shared-token rotation within one invalidation generation preserves its
+catalog; an account/secret invalidation still discards it, even if a token string
+is reused. Failed discovery may retain bounded display-only rows from that same
+generation, never credentials. A new generation cannot inherit old display metadata.
+Consumer discovery retries have an in-flight guard and a completion-based rate floor;
+exhausted initial loads are also paced. Manual Refresh may retry immediately.
+Catalog HTTP work is limited to four concurrent requests, and at most 32 shared
+definitions are admitted (UUID order, deterministic when defaults tie).
+Incomplete same-generation discovery may additionally retain up to 32 display-only
+rows, prioritizing active/open selections. Removing the token-rotation exemption,
+display-row retention, or discovery rate floor each fails its corresponding
+SharedProviderReviewTest regression (mutation-verified).
+When shared discovery is enabled, its sharing-aware RPC is the single cold vault
+scan: owned provider credentials and managed definitions are derived from that one
+snapshot, while a failed sharing scan falls back to the narrower owned-secret RPC.
+Rows label their provenance (shared by, organisation, or the user's vault), and
+publisher names are stripped of control characters before display. Broker scope
+checks for both endpoints use one host-registry snapshot. The 32-provider admission
+cap warns but remains an authoritative completed scan; the 2000-row scan cap and a
+scope refusal remain incomplete. Startup warns before falling back from a revoked
+saved share, and a Refresh job completes only after its initial load completes.
+The single-scan path, publisher-name sanitization, and startup fallback warning are
+mutation-verified by the shared-provider regression tests.
+Host broker exceptions are converted to a failed, unconfigured provider while coroutine
+cancellation still propagates, so the initial consumer load cannot cancel a non-supervisor
+plugin scope merely because a host bridge violated its Result-returning contract.
+The unavailable-model banner and effective shared connection both resolve transient
+catalog fallback through `usableSharedCatalog`; they cannot disagree about whether a
+saved model disappeared. `connectionsLoaded` is a one-way "loaded at least once" latch,
+so an exhausted later refresh reports its error without making waiting consumers regress.
+Only explicit `owner` and `org` access levels can supply personal provider credentials;
+unknown levels remain read-only and cannot silently become the user's API key.
+Replacing the banner's fallback resolver with a Loaded-only cast fails the dedicated
+transient-fallback regression (mutation-verified).
+The sharing-aware RPC necessarily decrypts bounded pages containing readable shares;
+the store immediately projects them to non-secret provider metadata and retains no shared
+password. A host with no currently scoped broker skips that wider scan entirely. Competing
+default recommendations rank own-vault, then organisation, then direct-share provenance;
+that provenance is presentation/default ordering only and never an authorization signal.
+
+Review regressions were mutation-checked: reading the derived connection in
+`selectModel` fails the default consumer test (100 instead of the original 2000
+token preference); removing the discovery scope guard fails the malicious-share
+assertion. The malicious id sorts inside the 32-provider cap, so the cap cannot
+make that security assertion pass accidentally.
+
+Absent shared preference entries are retained, not pruned on discovery: a transient
+read failure or capped scan cannot prove revocation, and deleting them would lose
+the user's model choice if access returns. `readModels` filters a view; it never
+pruned the on-disk preference file even before shared ids were introduced.
+
+`SharedProviderReviewTest` covers scan caching/expiry/invalidation, unsupported
+hosts, capped scans, separate error reporting, startup selection, disk isolation,
+and active-share removal. `ModelCatalogClientParseTest` uses the backend's numeric
+bigint allowance shape as well as string-encoded counts and malformed capabilities.
+Mutation-verified: removing scope confinement fails both original scope tests;
+removing each disk guard fails its separate write/seed test; accepting stale saved
+ids fails startup selection; unconditional machine listing fails its gate test;
+and restoring string-only allowance parsing fails the numeric-envelope test.
+
+The deployment/definition schema is documented in the host repository at
+`supabase/functions/boss-ai/README.md`. A host release must register the trusted
+broker for legacy shares; automatic BOSS AI uses the plugin-owned ticket flow instead.
+
 This plugin owns **all** AI provider configuration. The host has none: its
 `Settings → AI Providers` section renders `LlmProviderSettingsPanel` through
 `LlmProviderSettingsAPI`, and `PluginContext.llmProvider` is relayed from the same
 registered instance. Provider registry, credentials, environment-variable resolution
 and the model catalogue all live here.
+
+### Consumer discovery is connection-first and credential-free
+
+`configuredProviders()` returns resolved connections for consumers that own model selection;
+`activeConfig()` keeps the stricter ready-to-send-default-or-null contract. A model-independent
+connection may therefore carry a blank `modelId`, but never a missing required credential; a blank
+`apiKey` means the service is keyless and the consumer omits credential headers. Google-style
+model-in-path providers are omitted until a default exists because their complete endpoint cannot
+otherwise be formed. This semantic split is part of the API KDoc, not merely an implementation
+detail, because already-installed consumers can call either method.
+
+`availableModels()` is credential-free and asynchronous. Missing catalog state is omitted, a
+successfully fetched empty catalog is returned as an empty list, and `Failed.lastKnown` remains
+available so an offline refresh does not empty a consumer's picker. It uses the same machine-facing
+listing rule as `configuredProviders`: an Ollama daemon appears only after its catalog loaded.
+`addedProviderIds` is deliberately excluded because it is a UI-session affordance for keeping the
+Install card visible, not evidence that another plugin can call localhost. Both consumer methods
+start catalog discovery so their answers do not depend on which one another plugin called first.
+
+`ensureCatalogsLoaded` always awaits the Ollama system probe before a sweep, bounds its wait for the
+credential load, spaces consumer-triggered sweeps, and releases its in-flight guard on every exit.
+Transient provider failures have their own five-minute retry floor; 401/403 failures remain parked
+until the credential changes. `load()` marks discovery started too: invalidating a changed
+credential must never clear a catalog without scheduling its replacement. `catalogsLoaded` drops
+false across that invalidation and becomes true only after the replacement sweep completes.
 
 ### Legacy plaintext key import
 
@@ -506,6 +700,10 @@ hit once already:
   carries the stamped copy; adding the raw directory put an *unstamped* `plugin.json` in the jar
   too (the committed one says `1.0.9`), and with `duplicatesStrategy = EXCLUDE` the winner was
   decided by `from` order alone.
+- The ordinary `jar` and `buildPluginJar` otherwise resolve to the same filename. The ordinary
+  jar lives under `build/intermediates/jar`, not `build/libs`: the shared release workflow globs
+  `build/libs/*.jar`, and two tasks writing the release path let a plain jar overwrite the verified
+  plugin artifact after `verifyPackagedJar` had already passed.
 
 `PluginVersionTest` asserts against `boss.plugin.expectedVersion`, injected by the Test task from
 the Gradle version. Comparing the reported version to the bundled `plugin.json` would be circular -
@@ -591,8 +789,8 @@ fine.
 `context.authDataProvider` is read on the always-taken registration path, and so are the four
 `AuthDataProvider` members the ViewModel touches - a member newer than the floor is a
 `NoSuchMethodError` there that takes the whole plugin down, not just the AI section. All five
-were checked with `javap` against the released `boss-plugin-api-1.0.73.jar` (exactly
-`minApiVersion`), not assumed: `PluginContext.getAuthDataProvider`, plus `getCurrentUser`,
+were checked with `javap` against the released `boss-plugin-api-1.0.73.jar` (which predates the
+current floor), not assumed: `PluginContext.getAuthDataProvider`, plus `getCurrentUser`,
 `isAdmin`, `hasPermission(String)` and `getUserPermissions`.
 
 ### Provider keys are withheld from `secret_get`
@@ -640,15 +838,19 @@ Providers instead get an assisted flow: a "Get API key" button opening
 
 ### Linkage containment
 
-The guard covers the `Llm*` symbols only, so anything else this plugin touches must
-genuinely predate the declared `apiVersion` floor, which is **1.0.73** (`plugin.json`, both
-`apiVersion` and `minApiVersion`). This paragraph said 1.0.20 long after the manifest moved -
-understating the floor by 53 releases makes safe symbols look dangerous and sends people down
-pointless `LinkageError`-guard detours, so check it against `plugin.json` rather than trusting
-the prose. Verified against the api tags:
+The manifest's declared `apiVersion` floor is **1.0.89** (`plugin.json`, both `apiVersion` and
+`minApiVersion`). Check it rather than trusting prose: this section has lagged the manifest twice.
+The registration guard remains a final containment boundary for malformed host installations,
+not a substitute for declaring every type in a public method signature. In particular,
+`AiProviderModels` and `AiAvailableModel` first ship in **v1.0.89**; they occur in
+`availableModels()`'s signature, can resolve after guarded construction, and may be inspected by
+the host's binary validator before registration. That is why the floor moved instead of claiming
+the guard made older hosts safe.
+
+Earlier audits remain useful evidence. Verified against the api tags:
 `PluginContext.windowId`, `PluginContext.settingsProvider`, `SettingsProvider` and
 `openSettings` all landed in **1.0.16** and are present in the `v1.0.20` tag. (That check
-predates the floor moving to 1.0.73 and still holds: the api is additive-only, so presence in
+predates the floor moving and still holds: the api is additive-only, so presence in
 an earlier tag implies presence in every later one. Do not read it as the floor being 1.0.20.) That matters
 because they are read on the always-taken registration path (`registerPanel`), outside any
 guard - a member newer than the floor would throw `NoSuchMethodError` there and take the
@@ -666,37 +868,40 @@ true the moment the panel is rendered from `SecretManagerContent`".
 `BossBadge`, `BossTabIndicator` and `BossEmptyState` from `SecretManagerContent` and
 `SharedSecretsSection`, i.e. on the always-taken path, so a host missing any of them throws
 `NoSuchMethodError` where nothing can catch it. All five were therefore checked **against the
-declared floor rather than the local jar** - `git show v1.0.73:.../BossComponents.kt` in the api
+then-declared floor rather than the local jar** - `git show v1.0.73:.../BossComponents.kt` in the api
 checkout - along with `BossThemeColors.TextMuted`, `AccentColor` and `BorderColor`. Reading the
 sibling checkout's newest jar (1.0.84 at the time) would have proved nothing about 1.0.73. The
 rule for the next component: check the tag, not the jar, and add it here.
 
-`LlmProviderSettingsApiImpl`, `BrokeredCredentialBridge` and `GatewayCliEngineAccess` are the
-**only** files referencing api symbols added after this plugin's declared floor
-(`LlmProviderSettingsAPI`, `LlmApiFormat.GOOGLE_GENERATIVE` from 1.0.71;
-`BrokeredCredentialProvider` and `PluginContext.brokeredCredentialProvider` from 1.0.74;
-`AiCliSessionAPI` and `AiCliHealth` from 1.0.78).
+The cross-plugin navigation path was checked against **v1.0.73**, not the newest jar:
+`PluginContext.applicationEventBus`, `ApplicationEventBus.eventsOfType(Class)`, and
+`CustomPluginEvent.eventName`/`payload` are all present there and therefore below today's floor.
+
+`BrokerInfo.scopedTo` is also read by `BrokeredCredentialBridge`. Verified against
+the released `v1.0.74` source, it predates the 1.0.89 floor. Scope is looked up live:
+the current host lists signed-out brokers with `available=false`, but the API does
+not promise every host keeps the same list throughout registration and sign-in.
+
+`LlmProviderSettingsApiImpl`, `BrokeredCredentialBridge` and `GatewayCliEngineAccess` remain the
+only files that name the newer AI API types (`LlmProviderSettingsAPI` and
+`LlmApiFormat.GOOGLE_GENERATIVE` from 1.0.71; `BrokeredCredentialProvider`,
+`PluginContext.brokeredCredentialProvider` and `LlmApiFormat.OPENAI_RESPONSES` from 1.0.74;
+`AiCliSessionAPI` and `AiCliHealth` from 1.0.78; model discovery types from 1.0.89).
 Everything else uses the plugin-local `WireFormat` enum, the plugin-local `BrokeredKeySource`
-seam, and the plugin-local `CliEngineAccess` seam. That is why `registerAiProviderSettings` can wrap registration
-in a `LinkageError` guard and why `plugin.json` keeps its lower `apiVersion`: on an older
-host the AI panel is simply not served, and secret management still works. Adding a
-new-api reference outside those two files would take the whole plugin down on such a host.
+seam, and the plugin-local `CliEngineAccess` seam. Keep the adapter boundary even with the higher
+floor: it limits blast radius when a host API installation is incoherent.
 
 `ProviderCredentialStore` is constructed **outside** the guard, which is why it cannot
 hold an api type and gets `brokeredKeys` assigned after the fact. Left null, brokered
 providers report unconfigured - the same answer a host with no broker should give.
 
-### `LlmApiFormat.OPENAI_RESPONSES` is resolved reflectively, and has to be
+### Wire formats are direct at the declared API floor
 
-The GOOGLE_GENERATIVE argument ("it shipped in the same release as the interface, so any
-host that can link this class has both") does **not** extend to `OPENAI_RESPONSES`: it
-landed in 1.0.74, three releases later. A host on 1.0.71 links
-`LlmProviderSettingsApiImpl` fine and then throws `NoSuchFieldError` on the constant,
-because the enum is host-compiled and served parent-first. So it goes through
-`LlmApiFormat.valueOf` inside a `LinkageError`/`IllegalArgumentException` guard, and
-`configFor` returns null when it is missing - the provider reports unconfigured instead of
-crashing the section. Only `RISA_GLM` speaks that format and it needs the broker relay
-anyway, so on such a host it could never have worked.
+`LlmApiFormat.OPENAI_RESPONSES` once needed reflective resolution because it landed in 1.0.74
+while the plugin admitted 1.0.73 hosts. The 1.0.89 model-discovery signature raised the floor, so
+every enum constant used by `LlmProviderSettingsApiImpl` is now guaranteed and the reflective
+branch became misleading dead compatibility code. Map them directly; a new constant still requires
+checking its release against the manifest before use.
 
 ### Local CLI sessions
 
@@ -707,9 +912,9 @@ key-entry form would have a user paste a key they never needed.
 
 The gateway owns the engines; this panel owns the choice. `CliEngineAccess` is a plugin-local
 mirror of `AiCliSessionAPI` for the same reason `WireFormat` mirrors `LlmApiFormat`, and
-`GatewayCliEngineAccess` is the only file naming the api types - constructed inside the same
-`LinkageError` guard as the broker bridge, so an older host loses this section and nothing else.
-That is why `plugin.json` stays at its floor rather than moving to 1.0.78.
+`GatewayCliEngineAccess` is the only file naming the api types. The types predate today's floor,
+but keeping them at one adapter preserves the optional-gateway boundary and keeps the panel seam
+host-independent in tests.
 
 **Exactly one thing is active, and both setters enforce it.** `setActiveCliEngine` clears the
 HTTP provider and `setActiveProvider` calls `selectEngine(null)`. The second direction is the
@@ -905,6 +1110,96 @@ it: every endpoint-less provider must be either `CUSTOM` (the user types the id)
 fixed list, and nothing with an endpoint may have a fixed list. Without the second, this
 becomes the drifting hardcoded list `ModelCatalogClient` replaced.
 
+### Keyless providers: Ollama, and the four rules it needs
+
+`ProviderDescriptor.requiresApiKey` is about **the wire**: false means the provider takes no
+credential on a request, which is true of a local Ollama daemon and of nothing else here. It is
+deliberately not a general "is this provider usable" flag, and four separate rules hang off that
+distinction — each of which was got wrong once:
+
+- **The hardware gate is not `requiresApiKey`.** A machine below Ollama's own published floor
+  (`MIN_USABLE_RAM_GB`, 8 GB, from its README) can run no model at all, so `ProviderDetail`
+  replaces the whole card with an explanation and `AddProviderRow` stops offering it. That check
+  is Ollama-specific *on purpose*: `requiresApiKey` is a protocol fact, this is a hardware fact,
+  and folding them together would mean any future keyless provider inherited a RAM threshold that
+  has nothing to do with it.
+- **Listing is not `isConfigured`.** `ProviderConnection.isConfigured` is unconditionally true for
+  a keyless provider — there is no credential to wait on — so listing on it would put Ollama in
+  every user's provider list from first launch, whether or not they had ever run it. The rule
+  (`isProviderListed`) is instead "its catalog actually loaded", i.e. the daemon answered, **or**
+  the user explicitly added it this session (`addedProviderIds`). The second half is not optional:
+  without it a user with no daemon picks Ollama from Add provider, gets the card and the Install
+  button, closes it, and the row silently vanishes — which is precisely the user the flow exists
+  for. Session-scoped, not persisted: on the next launch "is the daemon answering" is the honest
+  rule again.
+- **The catalog fetch is gated on the binary.** A keyless provider is always `isConfigured`, so
+  `refreshStale` would reach `http://localhost:11434` for *every* user, on every panel entry and
+  on every store invalidation (which the secrets list triggers on any create/update/delete). It
+  fails fast and the `Failed` state is correctly hidden, but "the binary is not on this machine"
+  answers the same question for free. Only a *probed* absence skips it — `ollamaSystemInfo` is
+  null until then, and `load()` awaits the probe for exactly this reason.
+- **The key dialog must not offer it.** `ProviderRegistry.userKeyed` (`requiresApiKey &&
+  brokerId == null`) is what the secrets section's "Add AI provider key" dialog iterates. Over
+  `all`, that dialog offered Ollama — writing an `OLLAMA_API_KEY` into the vault that nothing
+  ever reads, over a plain-`http` endpoint with a bearer transport — and `RISA_GLM`, which is the
+  one place the "a brokered credential is never written to disk" rule was still reachable.
+
+`OllamaSystemInfo` is **null until probed**, not `binaryFound = false`. Same reason
+`CliEngineHealth` has an `Unknown` and `gatewayNotice` starts at `NONE`: the probe is async, and
+"Ollama doesn't appear to be installed on this machine" rendered in the frame before it lands is
+a claim, not a wait — to a user who does have it. Everything reading the field tests `== false`
+rather than negating, so an unprobed machine is never blocked or accused.
+
+### `/api/pull` is Ollama's own API, and success is the positive rule
+
+`OllamaModelInstaller` pulls a model by calling `POST /api/pull` directly rather than printing an
+`ollama pull` command for the user to run. That endpoint is Ollama's **native** API, not the
+OpenAI-compatible one `WireFormat` speaks — pulling is a management operation with no OpenAI
+equivalent — which is why it has its own fixed base URL rather than deriving one from the
+descriptor's `chatEndpoint`.
+
+**A pull succeeded iff the stream's terminal line is `{"status":"success"}`.** Do not go back to
+scanning for an error status: two real failures carry no error status at all, and both end with
+the ViewModel persisting a `selectedModelId` for a model that is not on disk — which `configFor`
+then hands to every other plugin as `LlmConfig.modelId`.
+
+- A **mid-stream failure** is its own object with no `status` key (`{"error":"pull model
+  manifest: file does not exist"}`), arriving after the HTTP 200, so neither the status code nor
+  a `status` scan can see it. That `error` field is the message the user can act on.
+- A **truncated stream** — daemon killed, disk full, laptop asleep — ends on an ordinary
+  `downloading` record.
+
+Mutation-verified: restoring the `contains("error")` rule fails three installer cases and the
+ViewModel's *a pull that fails mid-stream does not select a model that is not there*.
+
+`RAM_TIERS` is the one hardcoded model list in this plugin and a deliberate exception to the rule
+`ModelCatalogClient` exists to enforce. It is a *suggestion shortlist for a machine that has
+pulled nothing yet* — there is no endpoint to ask, because the honest answer from an empty daemon
+is an empty list — and the live picker stays the only authority on what is installed. The tags
+will drift; that file is the only place to change them.
+
+### The editor card is state, and this ViewModel outlives every visit
+
+`isEditorOpen` is separate from `selectedProviderId`, and only one of them survives a reload.
+Remembering which provider you were looking at is useful; reopening a transient form nobody asked
+for this time is not — so `load()` sets `isEditorOpen = false` and leaves `selectedProviderId`
+alone.
+
+This matters because the ViewModel is the plugin's **single instance**, shared between the sidebar
+AI tab and the host's `Settings → AI Providers` (see "Three sections, and the AI one is not owned
+by the panel"). A per-panel ViewModel would reset the flag for free by being reconstructed; this
+one carries whatever the last visit left, to both surfaces. `ProviderRow`'s
+`isSelected = state.isEditorOpen && …` guard depends on the reset too — without it the stale
+selection and the stale open flag survive together and the guard cannot do what it says.
+
+`closeEditor` also drops the provider's `keyDrafts` entry. That is what Cancel implies, and it is
+what the rest of this plugin's handling of plaintext requires: a pasted-but-unsaved key would
+otherwise sit in a process-lifetime ViewModel *and* reappear in the other surface's field.
+
+Two new classes landed here (`OllamaSystemCheck`, `OllamaModelInstaller`). Neither holds a
+`ComponentLogger`, so `buildPluginJar`'s `javap` guard passes — but that is a fact to re-check,
+not to assume, whenever a class is added to this package.
+
 ### Out-of-process caveat
 
 `plugin.json` declares `isolationMode: out-of-process`, which only engages under
@@ -915,7 +1210,7 @@ rather than failing.
 
 ### Tests
 
-`./gradlew test` - 214 host-independent cases, no live credential needed, run on every
+`./gradlew test` - 302 host-independent cases, no live credential needed, run on every
 pull request by `.github/workflows/test.yml`. The
 model-list parsers are the point: each was written from a provider's published
 reference, and xAI's and Together's envelopes aren't documented at all, so
@@ -933,6 +1228,16 @@ past the first page, and the cache honouring `invalidate()`. `ModelCatalogClient
 uses a response *queue* rather than one fixed body, which is what makes cursor-following, the
 `MAX_PAGES` bound and the xAI primary-then-fallback path reachable at all.
 
+**Every `AiProvidersViewModel` a test builds must be handed `noOllamaOnThisMachine()`.** `init`
+calls `refreshOllamaSystemInfo()`, so the default `OllamaSystemCheck()` reads the real `PATH`, the
+real `user.home` and the real JMX bean - which quietly falsifies `envIn`'s "every source of
+variables is injected" and makes the result depend on whether the machine running the suite
+happens to have Ollama installed. `OllamaSystemCheckTest` has the same rule for
+`physicalMemoryBytes`. The one case that genuinely needs the real predicate -
+"a directory carrying the x bit is not mistaken for the binary" - asserts on
+`OllamaSystemCheck.isRunnableBinary` directly rather than through `current()`, because the
+candidate list includes absolute paths like `/opt/homebrew/bin` that no injection reaches.
+
 **A test that races the ViewModel's own `init` is a test that eventually fails a release.**
 `anUnprobedEngineReadsAsCheckingRatherThanMissing` constructed the ViewModel and read
 `state.value` on the next line, racing `init`'s `refreshCliEngines()` launch on
@@ -946,6 +1251,10 @@ has not answered yet" is a state the test is *in* rather than a window it has to
 releases the gate and asserts the row updates - without that second half the test would pass
 against a ViewModel that never probed at all. Any new test here that asserts on a value `init`
 fills in asynchronously needs the same treatment; `loadedEngines()` exists for the other direction.
+
+`load()` marks `isLoading` **before** the launch, not inside it, so `load(); state.first { !it.isLoading }`
+is a deterministic wait rather than a race a test has to win. `AiProvidersPanelStateTest` depends
+on that; so does any future test of a `load()`-driven transition.
 
 Two suites were validated against deliberate mutations, because a test that passes
 unconditionally is indistinguishable from no test:

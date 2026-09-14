@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.secretmanager.ai
 import ai.rever.boss.plugin.api.SplitViewOperations
 import ai.rever.boss.plugin.logging.BossLogger
 import ai.rever.boss.plugin.logging.LogCategory
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -14,16 +15,35 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.net.ConnectException
+import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /** Everything the AI providers panel renders. */
 data class AiProvidersUiState(
     val providers: List<ProviderDescriptor> = ProviderRegistry.all,
     /** Provider whose detail is expanded in the panel. */
     val selectedProviderId: String = ProviderRegistry.default.id,
+    /**
+     * Whether the provider editor card is open at all.
+     *
+     * Separate from [selectedProviderId] on purpose: that field is remembered across a
+     * reload so reopening the section returns to the same provider, but the *card* should
+     * not reopen uninvited just because a previous visit left one expanded. Always false on
+     * a fresh load; set true only by picking a row or one of the two Add actions.
+     */
+    val isEditorOpen: Boolean = false,
     /** Provider served to other plugins as the active config. */
     val activeProviderId: String? = null,
     /**
@@ -57,6 +77,34 @@ data class AiProvidersUiState(
     val gatewayNotice: GatewayNotice = GatewayNotice.NONE,
     /** True while the Toolbox is being asked, so the button cannot be pressed twice. */
     val isAskingForGateway: Boolean = false,
+    /**
+     * What this machine can tell us about running Ollama, or **null until the probe answers**.
+     *
+     * Null rather than a `binaryFound = false` default for the same reason
+     * [CliEngineHealth.Unknown] exists and [gatewayNotice] starts at NONE: the probe is
+     * asynchronous, and a card that renders "Ollama doesn't appear to be installed on this
+     * machine" in the frame before it lands is making a claim rather than waiting — to a user
+     * who does have it installed. Everything reading this treats null as "don't say yet", and
+     * unknown RAM still reads as meeting the minimum once it *has* answered (see
+     * [OllamaSystemInfo.meetsMinimum]).
+     */
+    val ollamaSystemInfo: OllamaSystemInfo? = null,
+    /** The tag currently being pulled into Ollama, or null when no pull is in flight. */
+    val installingOllamaModelTag: String? = null,
+    /**
+     * Providers the user picked from "Add provider" in this session.
+     *
+     * Only a keyless provider needs this. An ordinary one earns its row by having a credential;
+     * a keyless one earns it by having a reachable daemon (`isProviderListed`), which is exactly
+     * what the user who just added Ollama does *not* have yet — so without this the row they
+     * added vanishes the moment they close the card, with nothing said, for precisely the user
+     * the whole install flow exists for.
+     *
+     * Session-scoped rather than persisted on purpose: on the next launch the rule that decides
+     * the row is "is the daemon answering", which is the honest one. This only stops an add from
+     * being undone while the user is still standing in front of it.
+     */
+    val addedProviderIds: Set<String> = emptySet(),
     val connections: Map<String, ProviderConnection> = emptyMap(),
     val catalogs: Map<String, CatalogState> = emptyMap(),
     /** In-progress key edits, keyed by provider id. Never persisted until saved. */
@@ -65,13 +113,28 @@ data class AiProvidersUiState(
     val isLoading: Boolean = false,
     /** False when the secret store is unavailable — env keys still work. */
     val storeAvailable: Boolean = true,
+    val sharedDiscoveryWarning: String? = null,
+    val providerSelectionWarning: String? = null,
     val error: String? = null,
     val notice: String? = null,
     val legacyOffer: LegacyImportOffer? = null,
 ) {
+    fun rawConnectionOf(providerId: String): ProviderConnection = connections[providerId]
+        ?: ProviderConnection(providerId = providerId, apiKey = "", source = CredentialSource.NONE)
+
     fun connectionOf(providerId: String): ProviderConnection =
-        connections[providerId]
-            ?: ProviderConnection(providerId = providerId, apiKey = "", source = CredentialSource.NONE)
+        effectiveSharedConnection(
+            rawConnectionOf(providerId),
+            catalogOf(providerId),
+        )
+
+    val unavailableSharedModel: Boolean get() {
+        val id = activeProviderId ?: return false
+        if (!isManagedProvider(id)) return false
+        val selected = connections[id]?.selectedModelId?.takeIf { it.isNotBlank() } ?: return false
+        val loaded = usableSharedCatalog(catalogOf(id)) ?: return false
+        return loaded.models.none { it.id == selected }
+    }
 
     fun catalogOf(providerId: String): CatalogState = catalogs[providerId] ?: CatalogState.NotConfigured
 
@@ -120,6 +183,16 @@ class AiProvidersViewModel(
     // observe a renewal is a test nobody runs.
     private val brokeredRenewalLeadMs: Long = BROKERED_RENEWAL_LEAD_MS,
     private val minBrokeredRenewalDelayMs: Long = MIN_BROKERED_RENEWAL_DELAY_MS,
+    /**
+     * How this machine's Ollama facts are read. Injected for the same reason [cliEngines] and
+     * [gateway] are — so it's fakeable without touching the real filesystem or `Desktop`.
+     */
+    private val ollamaSystemCheck: OllamaSystemCheck = OllamaSystemCheck(),
+    /** How a suggested model is actually pulled. Injected for the same reason as above. */
+    private val ollamaModelInstaller: OllamaModelInstaller = OllamaModelInstaller(),
+    private val catalogRefreshIntervalMs: Long = 30_000,
+    private val monotonicNanos: () -> Long = System::nanoTime,
+    private val catalogConnectionWaitTimeoutMs: Long = CATALOG_CONNECTION_WAIT_TIMEOUT_MS,
 ) {
     private val logger = BossLogger.forComponent("AiProvidersViewModel")
 
@@ -131,12 +204,31 @@ class AiProvidersViewModel(
 
     /** Guards [ensureConnectionsLoaded] so concurrent callers load credentials once. */
     private val connectionsLoadStarted = AtomicBoolean(false)
+    private val catalogsLoadStarted = AtomicBoolean(false)
+    private val catalogRefreshInFlight = AtomicBoolean(false)
+    private val catalogRefreshMutex = Mutex()
+    private val catalogRefreshGeneration = AtomicLong(0)
+    private val hasCatalogRefreshed = AtomicBoolean(false)
+    private val lastCatalogRefreshNanos = AtomicLong(0)
+    private val lastCatalogRefreshGeneration = AtomicLong(-1)
+    private val lastOllamaProbeNanos = AtomicLong(0)
+    private val _catalogsLoaded = MutableStateFlow(false)
+    /** False until the first catalog sweep finishes; an empty list before that is not definitive. */
+    val catalogsLoaded: StateFlow<Boolean> = _catalogsLoaded.asStateFlow()
+
+    /** The catalog source of truth; unlike the UI mirror, this cannot lag a completed sweep. */
+    fun catalogStateOf(providerId: String): CatalogState = catalog.stateOf(providerId)
+
+    fun descriptorOf(providerId: String): ProviderDescriptor? = state.value.providers.firstOrNull { it.id == providerId }
 
     /** The armed renewal, replaced on each reload rather than stacked. */
     private var brokeredRenewalJob: Job? = null
 
     /** Guards [refreshLapsedBrokeredCredential] so a burst of reads triggers one reload. */
     private val brokeredRefreshInFlight = AtomicBoolean(false)
+
+    /** The pull in flight, so [installOllamaModel] admits exactly one at a time. */
+    private val installingOllamaTag = AtomicReference<String?>(null)
 
     /**
      * When the last brokered refresh *finished*, as a floor on how often one may run.
@@ -158,6 +250,12 @@ class AiProvidersViewModel(
     private val lastBrokeredRefreshNanos = AtomicLong(Long.MIN_VALUE / 2)
 
     private val _connectionsLoaded = MutableStateFlow(false)
+    private val connectionLoadMutex = Mutex()
+    private val catalogFetchSlots = Semaphore(MAX_CONCURRENT_CATALOG_FETCHES)
+    private val discoveryRefreshThrottle = DiscoveryRefreshThrottle(minBrokeredRefreshIntervalMs, monotonicNanos)
+    private val lastConnectionLoadFailureNanos = AtomicLong(Long.MIN_VALUE / 2)
+    /** Guarded by connectionLoadMutex; a token rotation is not an account invalidation. */
+    private var connectionGeneration: Long? = null
 
     init {
         scope.launch { catalog.states.collect { states -> _state.update { it.copy(catalogs = states) } } }
@@ -175,10 +273,43 @@ class AiProvidersViewModel(
         store?.let { credentialStore ->
             scope.launch {
                 credentialStore.invalidations.drop(1).collect {
-                    if (connectionsLoadStarted.get()) reloadConnections()
+                    if (connectionsLoadStarted.get()) {
+                        try {
+                            reloadConnections()
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            logger.warn(LogCategory.NETWORK, "Could not reload AI provider connections")
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /**
+     * Do the work that only the panel needs, once, when the section is first shown.
+     *
+     * **The CLI probes are the reason this exists.** `refreshCliEngines()` runs
+     * `<engine> --version` for every engine the gateway serves, and it used to run from `init` -
+     * which is `register()`, on every launch, for a section most launches never open. Two engines
+     * is two processes spawned during startup to fill in a row nobody asked to see.
+     *
+     * `checkGateway()` moves for a second reason as well as cost: it asks the plugin loader about
+     * its own registry, and during `register()` that loader is part-way through loading *this*
+     * plugin.
+     *
+     * `ensureConnectionsLoaded()` deliberately does **not** move. Other
+     * plugins read `PluginContext.llmProvider` without this panel ever being opened, so it stays
+     * eager - the warm-up exists so the first AI action after a restart does not race the load.
+     *
+     * Idempotent: the section calls it on every entry, and the flag makes all but the first a
+     * no-op. Refresh is the deliberate re-read.
+     */
+    fun ensureSectionLoaded() {
+        if (!sectionLoadStarted.compareAndSet(false, true)) return
+        refreshCliEngines()
+        checkGateway()
     }
 
     /**
@@ -193,34 +324,93 @@ class AiProvidersViewModel(
      * cannot (it is a non-suspend api member), so a null from it may mean "not loaded
      * yet" rather than "nothing configured".
      */
-    /**
-     * Do the work that only the panel needs, once, when the section is first shown.
-     *
-     * **The CLI probes are the reason this exists.** `refreshCliEngines()` runs
-     * `<engine> --version` for every engine the gateway serves, and it used to run from `init` -
-     * which is `register()`, on every launch, for a section most launches never open. Two engines
-     * is two processes spawned during startup to fill in a row nobody asked to see.
-     *
-     * `checkGateway()` moves for a second reason as well as cost: it asks the plugin loader about
-     * its own registry, and during `register()` that loader is part-way through loading *this*
-     * plugin.
-     *
-     * `ensureConnectionsLoaded()` deliberately does **not** move. It is network-free and other
-     * plugins read `PluginContext.llmProvider` without this panel ever being opened, so it stays
-     * eager - the warm-up exists so the first AI action after a restart does not race the load.
-     *
-     * Idempotent: the section calls it on every entry, and the flag makes all but the first a
-     * no-op. Refresh is the deliberate re-read.
-     */
-    fun ensureSectionLoaded() {
-        if (!sectionLoadStarted.compareAndSet(false, true)) return
-        refreshCliEngines()
-        checkGateway()
-    }
-
     fun ensureConnectionsLoaded() {
+        if (monotonicNanos() - lastConnectionLoadFailureNanos.get() < minBrokeredRefreshIntervalMs * NANOS_PER_MILLI) return
         if (!connectionsLoadStarted.compareAndSet(false, true)) return
         scope.launch { loadConnections() }
+    }
+
+    /** Consumers need model metadata even when the settings panel has never been opened. */
+    fun ensureCatalogsLoaded() {
+        ensureConnectionsLoaded()
+        if (_connectionsLoaded.value && store?.sharedDefinitionsStale() == true &&
+            discoveryRefreshThrottle.begin()) {
+            scope.launch(Dispatchers.IO) { reloadConnectionsSafely() }
+                .invokeOnCompletion { discoveryRefreshThrottle.finish() }
+        }
+        catalogsLoadStarted.set(true)
+        // Consumer reads can be frequent. Re-check TTLs on demand, with a retry floor for
+        // transient failures instead of a perpetual refresh coroutine or one-shot latch.
+        val requestedAtNanos = monotonicNanos()
+        if (hasCatalogRefreshed.get() &&
+            requestedAtNanos - lastCatalogRefreshNanos.get() < catalogRefreshIntervalMs * NANOS_PER_MILLI
+        ) return
+        if (!catalogRefreshInFlight.compareAndSet(false, true)) return
+        scope.launch(Dispatchers.IO) {
+            try {
+                val connectionsReady =
+                    withTimeoutOrNull(catalogConnectionWaitTimeoutMs) {
+                        connectionsLoaded.first { it }
+                        true
+                    } == true
+                if (!connectionsReady) {
+                    logger.warn(LogCategory.NETWORK, "Timed out waiting to load AI provider connections")
+                    return@launch
+                }
+                val generation = catalogRefreshGeneration.get()
+                refreshCatalogs(state.value.connections, requestedAtNanos, generation, refreshOllamaProbe = false)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                logger.warn(LogCategory.NETWORK, "Could not refresh AI model catalogs")
+            }
+        }.invokeOnCompletion {
+            catalogRefreshInFlight.set(false)
+        }
+    }
+
+    /**
+     * Run one catalog sweep at a time, regardless of whether a consumer, panel load, or
+     * credential reload requested it.
+     *
+     * [requestedAtNanos] prevents two overlapping entry points from running back-to-back: if
+     * the sweep that held the mutex finished after this caller asked, it already satisfied the
+     * request. [generation] prevents that older sweep from publishing "loaded" after a changed
+     * credential invalidated its result.
+     */
+    private suspend fun refreshCatalogs(
+        connections: Map<String, ProviderConnection>,
+        requestedAtNanos: Long,
+        generation: Long,
+        refreshOllamaProbe: Boolean,
+    ) {
+        catalogRefreshMutex.withLock {
+            val catalogRequestSatisfied = hasCatalogRefreshed.get() &&
+                lastCatalogRefreshGeneration.get() == generation &&
+                lastCatalogRefreshNanos.get() >= requestedAtNanos
+            val probeRequestSatisfied =
+                !refreshOllamaProbe ||
+                    (state.value.ollamaSystemInfo != null && lastOllamaProbeNanos.get() >= requestedAtNanos)
+            if (catalogRequestSatisfied && probeRequestSatisfied) return
+            // Consumer polling reuses the previous probe. Panel entry forces one so a user who
+            // just followed the installer link sees Ollama without restarting BOSS.
+            var probeRan = false
+            if (refreshOllamaProbe || state.value.ollamaSystemInfo == null) {
+                readOllamaSystemInfo()
+                lastOllamaProbeNanos.set(monotonicNanos())
+                probeRan = true
+            }
+            if (generation != catalogRefreshGeneration.get()) return
+            // A newly installed daemon changes what refreshStale should fetch, even when an
+            // overlapping sweep already satisfied every catalog under the previous probe.
+            if (catalogRequestSatisfied && !probeRan) return
+            if (!_catalogsLoaded.value) catalog.seedFromCache()
+            refreshStale(connections)
+            hasCatalogRefreshed.set(true)
+            lastCatalogRefreshNanos.set(monotonicNanos())
+            lastCatalogRefreshGeneration.set(generation)
+            if (generation == catalogRefreshGeneration.get()) _catalogsLoaded.value = true
+        }
     }
 
     /**
@@ -229,24 +419,61 @@ class AiProvidersViewModel(
      */
     val connectionsLoaded: StateFlow<Boolean> = _connectionsLoaded.asStateFlow()
 
-    private suspend fun loadConnections(): Map<String, ProviderConnection> {
-        val storedActive = prefs.read()
-        val snapshot = store?.loadAll()
-        val connections = withPreferredModels(snapshot?.connections ?: envOnlyConnections())
+    private suspend fun loadConnections(): Map<String, ProviderConnection>? = connectionLoadMutex.withLock {
+        repeat(3) {
+            val startedAt = store?.invalidations?.value
+            val storedActive = prefs.read()
+            val snapshot = store?.loadAll()
+            val connections = withPreferredModels(snapshot?.connections ?: envOnlyConnections())
+            if (snapshot?.invalidatedDuringLoad == true || startedAt != store?.invalidations?.value) {
+                return@repeat
+            }
+            val descriptors = snapshot?.descriptors ?: ProviderRegistry.all
+            if (connectionGeneration != null && connectionGeneration != startedAt) {
+                _state.value.providers.filter { isManagedProvider(it.id) }
+                    .forEach { catalog.markNotConfigured(it.id) }
+            }
+            connectionGeneration = startedAt
 
-        _state.update { current ->
-            current.copy(
-                connections = connections,
-                activeProviderId = current.activeProviderId ?: storedActive ?: firstConfigured(connections),
-                storeAvailable = store != null && snapshot?.storeReadFailed != true,
-            )
+            _state.update { current ->
+                val preferred = current.activeProviderId ?: storedActive
+                val savedShareRemoved = snapshot?.sharedDiscoveryComplete != false &&
+                    preferred?.let(::isManagedProvider) == true &&
+                    descriptors.none { it.id == preferred }
+                current.copy(
+                    connections = connections,
+                    providers = descriptors,
+                    activeProviderId = if (snapshot?.sharedDiscoveryComplete == false &&
+                        preferred?.let(::isManagedProvider) == true) {
+                        preferred
+                    } else initialProviderId(preferred, descriptors, connections),
+                    storeAvailable = store != null && snapshot?.storeReadFailed != true,
+                    sharedDiscoveryWarning = snapshot?.sharedDiscoveryWarning,
+                    providerSelectionWarning = if (savedShareRemoved) {
+                        "The previously selected shared AI provider is unavailable. " +
+                            "Choose an available provider in AI settings."
+                    } else current.providerSelectionWarning,
+                    error = current.error.takeUnless { it == LOAD_RETRY_MESSAGE },
+                )
+            }
+            _connectionsLoaded.value = true
+            // Arm renewal on the first load too, even if no settings panel ever opens.
+            scheduleBrokeredRenewal()
+            return@withLock connections
         }
-        _connectionsLoaded.value = true
-        // Arm the renewal from the *first* load too, not only from later reloads: this is the path
-        // a consumer's very first `activeConfig()` takes, and without this the timer would only
-        // start once something else happened to reload.
-        scheduleBrokeredRenewal()
-        return connections
+        // A busy invalidation stream must not wedge the one-shot consumer load latch.
+        val hadLoaded = _connectionsLoaded.value
+        lastConnectionLoadFailureNanos.set(monotonicNanos())
+        connectionsLoadStarted.set(false)
+        // connectionsLoaded means "loaded at least once". Do not make an already
+        // satisfied consumer wait regress to false because a later refresh raced edits.
+        if (!hadLoaded) {
+            _connectionsLoaded.value = false
+            _catalogsLoaded.value = false
+        }
+        logger.warn(LogCategory.NETWORK, "AI provider load invalidated repeatedly; retry required")
+        _state.update { it.copy(error = LOAD_RETRY_MESSAGE) }
+        null
     }
 
     /**
@@ -276,27 +503,44 @@ class AiProvidersViewModel(
     }
 
     /** Load credentials, seed cached model lists, then refresh anything stale. */
-    fun load() {
+    fun load(): Job {
         connectionsLoadStarted.set(true)
-        scope.launch {
-            _state.update { it.copy(isLoading = true, error = null) }
-
-            catalog.seedFromCache()
+        catalogsLoadStarted.set(true)
+        val catalogRequestedAtNanos = monotonicNanos()
+        val catalogGeneration = catalogRefreshGeneration.get()
+        // Marked in flight synchronously, before the launch rather than inside it: `isLoading`
+        // is the panel's own "this entry is still settling" signal, and a caller that returns
+        // from load() to a state still reading `isLoading = false` is being told the load
+        // already finished. Nothing about the flag needs the coroutine.
+        _state.update { it.copy(isLoading = true, error = null) }
+        return scope.launch {
             // Re-read the environment on every entry into the section. The panel tells
             // users they can unset a variable to take key management over in BOSS, and the
             // resolver memoises misses as well as hits — so without this that instruction
             // was only true after an app restart.
             envResolver.invalidate()
-            val connections = loadConnections()
+            val connections = loadConnections() ?: run {
+                _state.update { it.copy(isLoading = false) }
+                return@launch
+            }
 
             _state.update { current ->
                 current.copy(
                     isLoading = false,
+                    // Closed on every entry into the section. This ViewModel is the plugin's
+                    // single instance, shared between the sidebar AI tab and the host's
+                    // Settings -> AI Providers, so without this an editor left open on one
+                    // visit rides through to the next one - and to the other surface - which
+                    // is the always-open form this redesign set out to remove. Deliberately
+                    // *not* symmetrical with selectedProviderId below: remembering which
+                    // provider you were looking at is useful, reopening a transient form
+                    // nobody asked for this time is not.
+                    isEditorOpen = false,
                     // Keep whichever provider the user had expanded. This runs from a
                     // LaunchedEffect on every entry into the section, so resetting the
                     // selection here discarded their place each time.
                     selectedProviderId =
-                        current.selectedProviderId.takeIf { ProviderRegistry.find(it) != null }
+                        current.selectedProviderId.takeIf { descriptorOf(it) != null }
                             ?: current.activeProviderId
                             ?: firstConfigured(connections)
                             ?: ProviderRegistry.default.id,
@@ -309,7 +553,15 @@ class AiProvidersViewModel(
                 )
             }
 
-            refreshStale(connections)
+            // The shared serializer also performs the awaited Ollama probe before deciding
+            // whether its local catalog is reachable. An overlapping consumer sweep can
+            // satisfy this request without a second provider-wide sweep.
+            refreshCatalogs(
+                connections,
+                catalogRequestedAtNanos,
+                catalogGeneration,
+                refreshOllamaProbe = true,
+            )
             checkLegacyImport()
         }
     }
@@ -347,22 +599,64 @@ class AiProvidersViewModel(
      */
     private suspend fun refreshStale(connections: Map<String, ProviderConnection>) =
         coroutineScope {
-            ProviderRegistry.all.map { descriptor ->
+            val localDaemonAbsent = _state.value.ollamaSystemInfo?.binaryFound == false
+            state.value.providers.map { descriptor ->
                 async {
                     val connection = connections[descriptor.id] ?: return@async
+                    // A keyless provider is unconditionally `isConfigured`, so without this
+                    // every user - overwhelmingly, users who will never run Ollama - fetched
+                    // http://localhost:11434 on every panel entry and on every store
+                    // invalidation, which the secrets list triggers on any create/update/delete.
+                    // Nothing broke (a fast connection-refused, and the Failed state is hidden),
+                    // but "the binary is not on this machine" is a free answer to the same
+                    // question. Only skipped on a *probed* absence: null means not yet asked.
+                    if (!descriptor.requiresApiKey && localDaemonAbsent) {
+                        catalog.markNotConfigured(descriptor.id)
+                        return@async
+                    }
                     if (!connection.isConfigured) {
                         catalog.markNotConfigured(descriptor.id)
                         return@async
                     }
                     if (!ProviderRegistry.hasKnownModels(descriptor)) return@async
-                    catalog.refresh(descriptor, connection.apiKey, force = false)
+                    catalogFetchSlots.withPermit {
+                        catalog.refresh(descriptor, connection.apiKey, force = false)
+                    }
                 }
             }.awaitAll()
             Unit
         }
 
+    /**
+     * Select [providerId] and open its editor card — picking a row or an Add action.
+     *
+     * Recording the id in [AiProvidersUiState.addedProviderIds] is what makes an add of a
+     * keyless provider stick; for one that already has a row it is a no-op.
+     */
     fun selectProvider(providerId: String) {
-        _state.update { it.copy(selectedProviderId = providerId, notice = null, error = null) }
+        _state.update {
+            it.copy(
+                selectedProviderId = providerId,
+                isEditorOpen = true,
+                addedProviderIds = it.addedProviderIds + providerId,
+                notice = null,
+                error = null,
+            )
+        }
+    }
+
+    /**
+     * Close the editor card without discarding anything already saved through it.
+     *
+     * Drops the unsaved key draft, which is what "Cancel" implies and what the rest of this
+     * plugin's handling of plaintext requires: this ViewModel outlives the card by the life of
+     * the process and is shared with the other surface, so a pasted-but-unsaved key would
+     * otherwise sit in memory until shutdown *and* reappear in the Settings window's field.
+     */
+    fun closeEditor() {
+        _state.update {
+            it.copy(isEditorOpen = false, keyDrafts = it.keyDrafts - it.selectedProviderId)
+        }
     }
 
     /**
@@ -380,6 +674,7 @@ class AiProvidersViewModel(
             _state.update {
                 it.copy(
                     activeProviderId = providerId,
+                    providerSelectionWarning = null,
                     // Only clear what we actually released. A gateway that refused leaves the
                     // engine serving requests, and showing it as inactive would be the exact
                     // disagreement this method exists to prevent.
@@ -441,6 +736,106 @@ class AiProvidersViewModel(
             _state.update { it.copy(gatewayNotice = notice) }
         }
     }
+
+    /**
+     * Re-read whether Ollama is installed and how much RAM this machine has.
+     *
+     * On IO, not the caller's dispatcher: this touches the filesystem (a handful of `File`
+     * stats) and a JMX bean, and `pluginScope` falls back to `Dispatchers.Main` — neither
+     * should ever be a reason a panel entry blocks on disk access.
+     */
+    fun refreshOllamaSystemInfo() {
+        scope.launch { readOllamaSystemInfo() }
+    }
+
+    /** [refreshOllamaSystemInfo]'s body, awaitable by a caller whose next step depends on it. */
+    private suspend fun readOllamaSystemInfo() {
+        val info =
+            withContext(Dispatchers.IO) {
+                runCatching { ollamaSystemCheck.current() }
+                    .getOrElse { OllamaSystemInfo(binaryFound = false, totalRamGb = null) }
+            }
+        _state.update { it.copy(ollamaSystemInfo = info) }
+    }
+
+    /**
+     * Send the user to Ollama's installer.
+     *
+     * Through the host's own tab, like the "Get API key" button next to it — an https page is
+     * exactly what `openUrlInActivePanel` is for, and it keeps the user inside BOSS.
+     * `GatewayPresence` reaches for `Desktop` only because it hands over a `boss://` deep link
+     * that a BOSS tab cannot take; this URL has no such constraint. The `Desktop` route survives
+     * as the fallback for a host that serves no split-view operations, and runs on IO because
+     * `Desktop.browse` hands off to the platform (xdg-open, LSOpenURLs) and can block — the same
+     * reason `askToolboxToInstall` is `suspend`.
+     */
+    fun openOllamaInstallPage() {
+        val operations = splitViewOperations
+        if (operations != null) {
+            operations.openUrlInActivePanel(OllamaSystemCheck.INSTALL_URL, "Install Ollama", forceNewTab = true)
+            return
+        }
+        scope.launch(Dispatchers.IO) {
+            if (!ollamaSystemCheck.openInstallPage()) {
+                _state.update { it.copy(notice = "Open ${OllamaSystemCheck.INSTALL_URL} to install Ollama.") }
+            }
+        }
+    }
+
+    /**
+     * Pull [tag] into the local Ollama daemon, then select it once it lands.
+     *
+     * One pull at a time, held in an [AtomicReference] rather than read back off `_state`:
+     * this is public API on a ViewModel two surfaces share, so a check-then-act on the state
+     * flow is only safe for as long as every caller happens to be the UI thread. Losing the
+     * `compareAndSet` means two concurrent pulls racing each other for the same disk write.
+     *
+     * Selecting the model on success — rather than leaving the picker empty for the user to
+     * notice a new entry and choose it themselves — is what makes "install" feel like it
+     * finished something, not just started a download. The busy flag clears *after* the
+     * catalog refresh and the selection, the way `saveKey` sequences it: clearing first
+     * re-enables Install while the refresh it depends on is still in flight.
+     */
+    fun installOllamaModel(tag: String) {
+        if (!installingOllamaTag.compareAndSet(null, tag)) return
+        _state.update { it.copy(installingOllamaModelTag = tag, error = null, notice = null) }
+        scope.launch {
+            try {
+                ollamaModelInstaller
+                    .pull(tag)
+                    .onSuccess {
+                        refreshOne(ProviderRegistry.OLLAMA, force = true)
+                        selectModel(ProviderRegistry.OLLAMA, tag)
+                        _state.update { it.copy(notice = "Pulled $tag.") }
+                    }.onFailure { error ->
+                        _state.update { it.copy(error = ollamaFailureMessage(tag, error)) }
+                    }
+            } finally {
+                installingOllamaTag.set(null)
+                _state.update { it.copy(installingOllamaModelTag = null) }
+            }
+        }
+    }
+
+    /**
+     * A pull failure in words the user can act on.
+     *
+     * The raw cause is a `ConnectException` whose message is "Connection refused", which tells
+     * a user nothing about what to do — and it is the *expected* failure for the two states this
+     * panel already knows about: the binary is not here, or it is here and the daemon is not
+     * running. Anything else keeps the underlying message, which for Ollama's own mid-stream
+     * errors ("pull model manifest: file does not exist") is the useful one.
+     */
+    private fun ollamaFailureMessage(tag: String, error: Throwable): String =
+        when {
+            error is ConnectException || error is SocketTimeoutException ->
+                if (_state.value.ollamaSystemInfo?.binaryFound == true) {
+                    "Ollama isn't running — start it and try again."
+                } else {
+                    "Ollama isn't installed on this machine yet — install it first, then pull $tag."
+                }
+            else -> error.message ?: "Could not pull $tag."
+        }
 
     /**
      * Ask the Toolbox to install the gateway, then re-check.
@@ -550,7 +945,7 @@ class AiProvidersViewModel(
         if (modelId.isBlank()) return
 
         val currentStore = store
-        val existing = _state.value.connectionOf(providerId)
+        val existing = _state.value.rawConnectionOf(providerId)
 
         // Reflect immediately; persistence follows. The picker should not appear to
         // reject a choice while a round-trip to the store completes.
@@ -562,6 +957,10 @@ class AiProvidersViewModel(
         }
 
         scope.launch {
+            if (isManagedProvider(providerId)) {
+                prefs.writeModel(providerId, modelId)
+                return@launch
+            }
             val settings =
                 ProviderSettings(
                     selectedModelId = modelId,
@@ -595,7 +994,8 @@ class AiProvidersViewModel(
 
     /** Persist a custom provider's endpoint, which has no models endpoint to discover. */
     fun setCustomEndpoint(providerId: String, endpoint: String) {
-        val existing = _state.value.connectionOf(providerId)
+        if (isManagedProvider(providerId)) return
+        val existing = _state.value.rawConnectionOf(providerId)
         val trimmed = endpoint.trim()
         _state.update {
             it.copy(connections = it.connections + (providerId to existing.copy(customEndpoint = trimmed)))
@@ -677,7 +1077,7 @@ class AiProvidersViewModel(
     fun testConnection(providerId: String) {
         scope.launch {
             withBusy(providerId) {
-                val descriptor = ProviderRegistry.find(providerId) ?: return@withBusy
+                val descriptor = descriptorOf(providerId) ?: return@withBusy
                 val connection = _state.value.connectionOf(providerId)
                 if (!connection.isConfigured) {
                     _state.update { it.copy(error = "Add an API key first.") }
@@ -702,7 +1102,7 @@ class AiProvidersViewModel(
 
     /** Open the provider's console so the user can create a key. */
     fun openProviderConsole(providerId: String) {
-        val descriptor = ProviderRegistry.find(providerId) ?: return
+        val descriptor = descriptorOf(providerId) ?: return
         val url = descriptor.consoleUrl
         if (url == null) {
             _state.update { it.copy(error = "${descriptor.displayName} has no key console.") }
@@ -780,7 +1180,7 @@ class AiProvidersViewModel(
      * A no-op for providers that are not brokered, and while a refresh is already running.
      */
     fun refreshLapsedBrokeredCredential(providerId: String) {
-        val brokerId = ProviderRegistry.find(providerId)?.brokerId ?: return
+        val brokerId = descriptorOf(providerId)?.brokerId ?: return
         val credentials = store ?: return
         if (!credentials.brokeredCredentialLapsed(brokerId)) return
         if (System.nanoTime() - lastBrokeredRefreshNanos.get() < minBrokeredRefreshIntervalMs * NANOS_PER_MILLI) {
@@ -791,14 +1191,14 @@ class AiProvidersViewModel(
         // returns from `cached` unless `invalidate()` has run. The floor is about the mint rate.
         //
         // IO because this can now fire from any consumer read, and `pluginScope` falls back to
-        // Dispatchers.Main. runCatching because a host `exchange`/`listSecrets` that throws rather
+        // Dispatchers.Main. Contain ordinary failures because a host `exchange`/`listSecrets` that throws rather
         // than returning a failed Result would escape and cancel the scope - and a plain
         // CoroutineScope(Main) is not a supervisor, so that would silently kill every later launch
         // in the plugin. invokeOnCompletion rather than finally: if the scope is already cancelled
         // the body never runs, and the flag would latch true forever - the same shape of latch as
         // the bug this PR fixes.
         scope
-            .launch(Dispatchers.IO) { runCatching { reloadConnections() } }
+            .launch(Dispatchers.IO) { reloadConnectionsSafely() }
             .invokeOnCompletion {
                 lastBrokeredRefreshNanos.set(System.nanoTime())
                 brokeredRefreshInFlight.set(false)
@@ -813,17 +1213,28 @@ class AiProvidersViewModel(
      * revoked in the Secrets section next door is the case it exists for, and the invalidation
      * collector only covers changes made through this plugin's own store.
      *
-     * On `Dispatchers.IO`, and `runCatching` around the body, for the same reasons the brokered
+     * On `Dispatchers.IO`, with ordinary failures contained, for the same reasons the brokered
      * refresh path documents: `pluginScope` falls back to `Dispatchers.Main`, and a host
      * `listSecrets` that throws instead of returning a failed `Result` would escape and cancel a
      * scope that is not a supervisor, silently killing every later launch in the plugin.
      */
-    fun refreshConnections() {
-        scope.launch(Dispatchers.IO) { runCatching { reloadConnections() } }
+    fun refreshConnections(): Job = scope.launch(Dispatchers.IO) {
+        store?.expireSharedDefinitions()
+        if (!_connectionsLoaded.value) load().join() else reloadConnectionsSafely()
     }
 
-    private suspend fun reloadConnections() {
-        val credentials = store ?: return
+    private suspend fun reloadConnectionsSafely() {
+        try {
+            reloadConnections()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            logger.warn(LogCategory.NETWORK, "Could not reload AI provider connections")
+        }
+    }
+
+    private suspend fun reloadConnections() = connectionLoadMutex.withLock {
+        val credentials = store ?: return@withLock
         // Mirrors the store's own generation guard, one layer up. The store refuses to seat a
         // `cached`/`brokeredCache` value from before an `invalidate()`, but the value consumers
         // actually read is `_state.connections`, and that write was unguarded: a refresh already
@@ -832,9 +1243,95 @@ class AiProvidersViewModel(
         // consumer read can start a reload.
         val startedAt = credentials.invalidations.value
         val reloaded = credentials.loadAll()
-        if (credentials.invalidations.value != startedAt) return
-        _state.update { it.copy(connections = withPreferredModels(reloaded.connections)) }
+        if (reloaded.invalidatedDuringLoad || credentials.invalidations.value != startedAt) return@withLock
+        val previous = _state.value.connections
+        val previousDescriptors = _state.value.providers.associateBy { it.id }
+        val sameGeneration = connectionGeneration == startedAt
+        // Retain display metadata only within the same account generation. These rows
+        // receive no connection and cannot authorize inference. Bound retained rows too.
+        val retained = if (!reloaded.sharedDiscoveryComplete && sameGeneration) {
+            previousDescriptors.values.filter { old ->
+                isManagedProvider(old.id) && reloaded.descriptors.none { it.id == old.id }
+            }.sortedBy { if (it.id == _state.value.activeProviderId || it.id == _state.value.selectedProviderId) 0 else 1 }
+                .take(ProviderCredentialStore.MAX_SHARED_PROVIDERS)
+        } else emptyList()
+        val nextDescriptors = (reloaded.descriptors + retained).associateBy { it.id }
+        val preferredConnections = withPreferredModels(reloaded.connections)
+        if (credentials.invalidations.value != startedAt) return@withLock
+        connectionGeneration = startedAt
+        val removed = previous.keys - preferredConnections.keys
+        val savedActive = prefs.read()
+        removed.forEach(catalog::markNotConfigured)
+        _state.update { current ->
+            val activeRemoved = reloaded.sharedDiscoveryComplete &&
+                current.activeProviderId?.let(::isManagedProvider) == true &&
+                current.activeProviderId !in preferredConnections
+            current.copy(
+                connections = preferredConnections,
+                providers = nextDescriptors.values.toList(),
+                activeProviderId = current.activeProviderId?.takeUnless { activeRemoved }
+                    ?: if (!activeRemoved && savedActive == null && current.activeCliEngineId == null) {
+                        nextDescriptors[BossAiDiscovery.PROVIDER_ID]?.takeIf {
+                            it.sharedDefault && preferredConnections[it.id]?.isConfigured == true
+                        }?.id
+                    } else null,
+                selectedProviderId = current.selectedProviderId.takeIf { it in nextDescriptors }
+                    ?: ProviderRegistry.default.id,
+                storeAvailable = !reloaded.storeReadFailed,
+                sharedDiscoveryWarning = reloaded.sharedDiscoveryWarning,
+                providerSelectionWarning = if (activeRemoved) {
+                    "The selected shared AI provider is unavailable. Choose an available provider in AI settings."
+                } else if (current.activeProviderId in preferredConnections) null else current.providerSelectionWarning,
+            )
+        }
+        // Re-arm promptly; a catalog sweep can wait behind another provider's network timeout.
         scheduleBrokeredRenewal()
+        val changed = _state.value.connections.filter { (id, connection) ->
+            val before = previous[id] ?: return@filter isManagedProvider(id)
+            val shared = isManagedProvider(id)
+            if (shared && !sameGeneration) return@filter true
+            if (shared && previousDescriptors[id] == nextDescriptors[id] &&
+                before.customEndpoint == connection.customEndpoint &&
+                before.apiKey.isNotBlank() && connection.apiKey.isNotBlank() &&
+                before.source == CredentialSource.BROKERED && connection.source == CredentialSource.BROKERED &&
+                usableSharedCatalog(catalog.stateOf(id)) != null) return@filter false
+            previousDescriptors[id] != nextDescriptors[id] || catalogInputChanged(id, before, connection)
+        }.keys
+        if (changed.isNotEmpty()) {
+            val generation = catalogRefreshGeneration.incrementAndGet()
+            _catalogsLoaded.value = false
+            changed.forEach(catalog::markNotConfigured)
+            if (catalogsLoadStarted.get()) {
+                val connections = _state.value.connections
+                val requestedAtNanos = monotonicNanos()
+                // Do not put provider network latency in front of the invalidation collector:
+                // another secret edit must be able to refresh the credential snapshot promptly.
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        refreshCatalogs(connections, requestedAtNanos, generation, refreshOllamaProbe = false)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        logger.warn(LogCategory.NETWORK, "Could not refresh AI model catalogs")
+                    }
+                }
+            }
+        }
+    }
+
+    /** Only inputs that can change a remotely discovered catalog warrant invalidating it. */
+    private fun catalogInputChanged(
+        providerId: String,
+        before: ProviderConnection,
+        after: ProviderConnection,
+    ): Boolean {
+        val descriptor = descriptorOf(providerId) ?: return false
+        // Fixed catalogs (including the brokered GLM provider) do not depend on a minted token,
+        // and manual providers have no catalog endpoint to invalidate.
+        if (!ProviderRegistry.hasKnownModels(descriptor) || ProviderRegistry.fixedModels.containsKey(providerId)) {
+            return false
+        }
+        return before.apiKey != after.apiKey || before.customEndpoint != after.customEndpoint
     }
 
     /**
@@ -867,15 +1364,15 @@ class AiProvidersViewModel(
                 // back the same credential. That made the first version of this a poller for
                 // lapse rather than a renewal.
                 credentials.expireBrokeredCache()
-                // runCatching for the same reason as refreshLapsedBrokeredCredential: a host
+                // Contain failures for the same reason as refreshLapsedBrokeredCredential: a host
                 // exchange that throws rather than returning a failed Result would escape and
                 // cancel this scope, which is not a supervisor.
-                runCatching { reloadConnections() }
+                reloadConnectionsSafely()
             }
     }
 
     private suspend fun refreshOne(providerId: String, force: Boolean) {
-        val descriptor = ProviderRegistry.find(providerId) ?: return
+        val descriptor = descriptorOf(providerId) ?: return
         val connection = _state.value.connectionOf(providerId)
         if (!connection.isConfigured) {
             catalog.markNotConfigured(providerId)
@@ -886,7 +1383,9 @@ class AiProvidersViewModel(
         // then hides — noise with no symptom. A provider with a FIXED list is not skipped:
         // it has models to seat, just no endpoint to ask.
         if (!ProviderRegistry.hasKnownModels(descriptor)) return
-        catalog.refresh(descriptor, connection.apiKey, force = force)
+        catalogFetchSlots.withPermit {
+            catalog.refresh(descriptor, connection.apiKey, force = force)
+        }
     }
 
     private suspend fun withBusy(providerId: String, block: suspend () -> Unit) {
@@ -899,6 +1398,8 @@ class AiProvidersViewModel(
     }
 
     private companion object {
+        const val LOAD_RETRY_MESSAGE = "AI provider settings changed while loading. Retry using Refresh."
+        const val MAX_CONCURRENT_CATALOG_FETCHES = 4
         /**
          * Floor on how often a brokered refresh may run.
          *
@@ -908,6 +1409,7 @@ class AiProvidersViewModel(
          */
         const val DEFAULT_MIN_BROKERED_REFRESH_INTERVAL_MS = 5_000L
         const val NANOS_PER_MILLI = 1_000_000L
+        const val CATALOG_CONNECTION_WAIT_TIMEOUT_MS = 30_000L
 
         /**
          * How far ahead of a brokered credential's reuse deadline to renew it.

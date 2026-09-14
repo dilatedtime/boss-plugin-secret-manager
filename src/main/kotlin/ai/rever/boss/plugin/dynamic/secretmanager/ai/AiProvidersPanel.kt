@@ -32,6 +32,7 @@ import androidx.compose.material.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Extension
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -48,6 +49,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.roundToInt
 
 /**
  * Settings surface for AI providers: credentials, and a model picker driven by each
@@ -61,8 +63,12 @@ fun AiProvidersPanel(
     viewModel: AiProvidersViewModel,
     modifier: Modifier = Modifier,
 ) {
+    androidx.compose.runtime.LaunchedEffect(viewModel) {
+        viewModel.ensureSectionLoaded()
+        viewModel.ensureCatalogsLoaded()
+    }
     val state by viewModel.state.collectAsState()
-    val selected = ProviderRegistry.findOrDefault(state.selectedProviderId)
+    val selected = state.providers.firstOrNull { it.id == state.selectedProviderId } ?: ProviderRegistry.default
 
     // Scrolls itself: the host registers this as an embedded panel and does not wrap it
     // in a scroll container (nesting two would measure with infinite height and crash).
@@ -93,30 +99,49 @@ fun AiProvidersPanel(
             )
         }
         state.error?.let { MessageBanner(it, BossThemeColors.ErrorColor) }
+        state.sharedDiscoveryWarning?.let { MessageBanner(it, BossThemeColors.WarningColor) }
+        state.providerSelectionWarning?.let { MessageBanner(it, BossThemeColors.WarningColor) }
+        if (state.unavailableSharedModel) {
+            MessageBanner("The selected shared model is no longer published. Choose another model.", BossThemeColors.WarningColor)
+        }
         state.notice?.let { MessageBanner(it, BossThemeColors.SuccessColor) }
 
-        // Where the CLI section would be. The gateway serving no engines is still silence, but
-        // the gateway being *absent* is a thing the user can fix, and telling them costs one row.
-        if (state.gatewayNotice != GatewayNotice.NONE) {
-            GatewayMissingNotice(
-                notice = state.gatewayNotice,
-                isAsking = state.isAskingForGateway,
-                onRequest = viewModel::requestGateway,
-            )
-        }
+        // One heading for the whole surface: a CLI session and an HTTP provider are both
+        // just "a way to answer AI requests", and two section titles over what is really
+        // one list read as more structure than is here.
+        BossSection(
+            title = "Available Providers",
+        ) {
+            // Where the CLI subsection would be. The gateway serving no engines is still
+            // silence, but the gateway being *absent* is a thing the user can fix, and
+            // telling them costs one row.
+            if (state.gatewayNotice != GatewayNotice.NONE) {
+                GatewayMissingNotice(
+                    notice = state.gatewayNotice,
+                    isAsking = state.isAskingForGateway,
+                    onRequest = viewModel::requestGateway,
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+            }
 
-        // Above the providers on purpose: for a user who already has a `claude` or `codex`
-        // login, this is the whole setup, and burying it under a key-entry form would have
-        // them paste a key they never needed. Absent entirely when the gateway serves none,
-        // rather than showing an empty section nobody can act on.
-        if (state.cliEngines.isNotEmpty()) {
-            BossSection(
-                title = "Local CLI sessions",
-                // The one fact that is not visible from the rows: picking one takes over from
-                // the providers below, for every plugin. "Use a CLI you have already signed
-                // into" was three lines restating the section's own title.
-                description = "A login you already have. Overrides the provider below.",
-            ) {
+            // Above the providers on purpose: for a user who already has a `claude` or
+            // `codex` login, this is the whole setup, and burying it under a key-entry
+            // form would have them paste a key they never needed. Absent entirely when
+            // the gateway serves none, rather than showing an empty subsection nobody can
+            // act on.
+            if (state.cliEngines.isNotEmpty()) {
+                Text(
+                    text = "Local CLI sessions",
+                    style = SecretPanelType.bodyStrong,
+                    color = BossThemeColors.TextPrimary,
+                )
+                Text(
+                    text =
+                        "A login you already have. Overrides the provider below.",
+                    style = SecretPanelType.meta,
+                    color = BossThemeColors.TextSecondary,
+                    modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
+                )
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     state.cliEngines.forEach { engine ->
                         CliEngineRow(
@@ -135,34 +160,79 @@ fun AiProvidersPanel(
                         )
                     }
                 }
+                Spacer(modifier = Modifier.height(16.dp))
             }
-        }
 
-        // An accordion, not a list plus a detached detail pane.
-        //
-        // The detail used to render *below the whole list* as its own titled section. In the
-        // host's Settings window that was fine - it was all on screen at once. In a sidebar
-        // roughly one row wide it meant tapping the fourth of eight providers and having the
-        // thing that responded appear off the bottom of the panel: the tap read as doing
-        // nothing. Expanding under the row that was tapped puts the response where the finger
-        // is, and drops the duplicate provider name the detail's own heading used to repeat.
-        BossSection(title = "Providers") {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                state.providers.forEach { descriptor ->
-                    ProviderRow(
-                        descriptor = descriptor,
-                        connection = state.connectionOf(descriptor.id),
-                        isSelected = descriptor.id == state.selectedProviderId,
-                        isActive = descriptor.id == state.activeProviderId,
-                        onClick = { viewModel.selectProvider(descriptor.id) },
-                    )
-                    if (descriptor.id == selected.id) {
-                        ProviderDetail(
-                            descriptor = descriptor,
-                            state = state,
-                            viewModel = viewModel,
+                val listed =
+                    state.providers.filter {
+                        // The UI keeps unavailable shares visible; machine lists require readiness.
+                        isManagedProvider(it.id) || isProviderListed(
+                            it,
+                            state.connectionOf(it.id),
+                            state.catalogOf(it.id),
+                            wasAddedByUser = it.id in state.addedProviderIds,
                         )
                     }
+
+                if (listed.isEmpty()) {
+                    Text(
+                        text = "No providers added yet.",
+                        style = SecretPanelType.meta,
+                        color = BossThemeColors.TextSecondary,
+                    )
+                } else {
+                    listed.forEach { descriptor ->
+                        ProviderRow(
+                            descriptor = descriptor,
+                            connection = state.connectionOf(descriptor.id),
+                            // Only the row whose editor is actually open reads as selected —
+                            // a stale selectedProviderId from a previous visit must not paint
+                            // a row as open when the card below it is closed.
+                            isSelected = state.isEditorOpen && descriptor.id == state.selectedProviderId,
+                            isActive = descriptor.id == state.activeProviderId,
+                            onClick = { viewModel.selectProvider(descriptor.id) },
+                        )
+                        if (state.isEditorOpen && descriptor.id == selected.id) {
+                            ProviderDetail(
+                                descriptor = descriptor,
+                                state = state,
+                                viewModel = viewModel,
+                                onCancel = viewModel::closeEditor,
+                                showTitle = false,
+                            )
+                        }
+                    }
+                }
+
+                val listedIds = listed.mapTo(mutableSetOf()) { it.id }
+                AddProviderRow(
+                    addable =
+                        state.providers.filter { descriptor ->
+                            descriptor.id != ProviderRegistry.CUSTOM &&
+                                descriptor.id !in listedIds &&
+                                // A machine that cannot usefully run any model through Ollama
+                                // is not offered it as something to add — see ProviderDetail's
+                                // own blocked-state card for the one already-configured
+                                // exception this does not cover. `!= false` rather than a bare
+                                // negation: an unprobed machine (null) is offered the provider,
+                                // since withholding it would be a claim about hardware nobody
+                                // has looked at yet.
+                                !(
+                                    descriptor.id == ProviderRegistry.OLLAMA &&
+                                        state.ollamaSystemInfo?.meetsMinimum == false
+                                )
+                        },
+                    onPick = viewModel::selectProvider,
+                    onPickCustom = { viewModel.selectProvider(ProviderRegistry.CUSTOM) },
+                )
+                if (state.isEditorOpen && selected.id !in listedIds) {
+                    ProviderDetail(
+                        descriptor = selected,
+                        state = state,
+                        viewModel = viewModel,
+                        onCancel = viewModel::closeEditor,
+                    )
                 }
             }
         }
@@ -319,6 +389,54 @@ private fun healthLine(
         CliEngineHealth.Unknown -> "Checking…"
     }
 
+/**
+ * Two equal-weight ways to gain a provider, not a search box: the catalog is small enough
+ * that a plain list beats a filter, and "add one of these" versus "declare a custom
+ * endpoint" are different enough flows to deserve their own buttons rather than one menu
+ * that mixes both.
+ *
+ * Picking either just selects the provider — [ProviderDetail] below already renders
+ * whatever is selected, configured or not, so there is no separate "add" form to build.
+ */
+@Composable
+private fun AddProviderRow(
+    addable: List<ProviderDescriptor>,
+    onPick: (String) -> Unit,
+    onPickCustom: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box {
+            BossSecondaryButton(
+                text = "Add provider",
+                onClick = { expanded = true },
+                enabled = addable.isNotEmpty(),
+            )
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier.heightIn(max = 320.dp).background(BossThemeColors.SurfaceColor),
+            ) {
+                addable.forEach { descriptor ->
+                    DropdownMenuItem(
+                        onClick = {
+                            expanded = false
+                            onPick(descriptor.id)
+                        },
+                    ) {
+                        Text(
+                            text = descriptor.displayName,
+                            style = SecretPanelType.body,
+                            color = BossThemeColors.TextPrimary,
+                        )
+                    }
+                }
+            }
+        }
+        BossSecondaryButton(text = "Add custom provider", onClick = onPickCustom)
+    }
+}
+
 @Composable
 private fun ProviderRow(
     descriptor: ProviderDescriptor,
@@ -340,13 +458,22 @@ private fun ProviderRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        StatusDot(connection.source)
-        Text(
-            text = descriptor.displayName,
-            style = SecretPanelType.body,
-            color = BossThemeColors.TextPrimary,
-            modifier = Modifier.weight(1f),
-        )
+        StatusDot(connection.source, noKeyNeeded = !descriptor.requiresApiKey)
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = descriptor.displayName,
+                style = SecretPanelType.body,
+                color = BossThemeColors.TextPrimary,
+            )
+            descriptor.sharedSourceLabel?.let { source ->
+                Text(
+                    text = source,
+                    style = SecretPanelType.caption,
+                    color = BossThemeColors.TextMuted,
+                    maxLines = 1,
+                )
+            }
+        }
         if (isActive) {
             Text(
                 text = "Active",
@@ -355,31 +482,56 @@ private fun ProviderRow(
             )
         }
         Text(
-            text = statusLabel(connection),
+            text = statusLabel(connection, noKeyNeeded = !descriptor.requiresApiKey),
             style = SecretPanelType.caption,
             color = BossThemeColors.TextMuted,
+        )
+        // The row itself is already clickable, same target — this is for discoverability:
+        // "tap anywhere to edit" is not obvious from a row that otherwise reads as static.
+        //
+        // No contentDescription, and no separate click target: the row above already carries
+        // the provider name and the same action, so describing this would make a screen reader
+        // read the provider twice in one row — the double-read AGENTS.md records for
+        // QuietCopyButton and SharedSecretBadge. Purely decorative, so it is announced as
+        // nothing at all rather than as a second 16dp button.
+        Icon(
+            imageVector = Icons.Outlined.Edit,
+            contentDescription = null,
+            tint = BossThemeColors.TextSecondary,
+            modifier = Modifier.size(16.dp),
         )
     }
 }
 
 @Composable
-private fun StatusDot(source: CredentialSource) {
+private fun StatusDot(source: CredentialSource, noKeyNeeded: Boolean) {
     val color =
-        when (source) {
-            CredentialSource.STORED -> BossThemeColors.SuccessColor
-            CredentialSource.BROKERED -> BossThemeColors.SuccessColor
-            CredentialSource.ENVIRONMENT -> BossThemeColors.SecondaryColor
-            CredentialSource.NONE -> BossThemeColors.TextMuted
+        if (noKeyNeeded) {
+            // A local daemon with no credential is either reachable or it isn't; there
+            // is no "not configured" state for it to sit in, so it reads as ready
+            // rather than piggybacking on a CredentialSource it will never earn.
+            BossThemeColors.SuccessColor
+        } else {
+            when (source) {
+                CredentialSource.STORED -> BossThemeColors.SuccessColor
+                CredentialSource.BROKERED -> BossThemeColors.SuccessColor
+                CredentialSource.ENVIRONMENT -> BossThemeColors.SecondaryColor
+                CredentialSource.NONE -> BossThemeColors.TextMuted
+            }
         }
     Box(modifier = Modifier.size(8.dp).clip(RoundedCornerShape(4.dp)).background(color))
 }
 
-private fun statusLabel(connection: ProviderConnection): String =
-    when (connection.source) {
-        CredentialSource.STORED -> "Stored"
-        CredentialSource.ENVIRONMENT -> connection.label?.let { "From $it" } ?: "From environment"
-        CredentialSource.BROKERED -> "Signed in"
-        CredentialSource.NONE -> "Not configured"
+private fun statusLabel(connection: ProviderConnection, noKeyNeeded: Boolean): String =
+    if (noKeyNeeded) {
+        "No key needed"
+    } else {
+        when (connection.source) {
+            CredentialSource.STORED -> "Stored"
+            CredentialSource.ENVIRONMENT -> connection.label?.let { "From $it" } ?: "From environment"
+            CredentialSource.BROKERED -> "Signed in"
+            CredentialSource.NONE -> "Not configured"
+        }
     }
 
 @Composable
@@ -387,127 +539,335 @@ private fun ProviderDetail(
     descriptor: ProviderDescriptor,
     state: AiProvidersUiState,
     viewModel: AiProvidersViewModel,
+    onCancel: () -> Unit,
+    showTitle: Boolean = true,
 ) {
     val connection = state.connectionOf(descriptor.id)
     val busy = descriptor.id in state.busyProviderIds
     val fromEnvironment = connection.source == CredentialSource.ENVIRONMENT
     val brokered = descriptor.brokerId != null
+    val noKeyNeeded = !descriptor.requiresApiKey
+    // A machine below Ollama's own published RAM floor cannot run anything through it, so
+    // there is nothing here worth a key field, a model list or an activate button — only an
+    // explanation. Any other keyless provider added later would need its own such check;
+    // this one is Ollama-specific on purpose rather than folded into requiresApiKey, since
+    // requiresApiKey is about the wire protocol and this is about the hardware.
+    // `== false`, not `!meetsMinimum`: null is "the probe has not answered", and a card that
+    // says "not available on this machine" before anyone read the RAM is a claim, not a wait.
+    val ollamaBlocked =
+        descriptor.id == ProviderRegistry.OLLAMA && state.ollamaSystemInfo?.meetsMinimum == false
 
-    // No section heading of its own: the row directly above is the provider's name, and
-    // repeating it was the loudest thing in the expanded state.
-    BossCard {
+    // One card for the whole editor — title through the activate button — rather than two
+    // separate cards (key section, model section) with a header floating above both. Add and
+    // edit are the same form, so there is exactly one boundary to open and close.
+    BossCard(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            if (brokered) {
-                // No key field at all: there is nothing for the user to paste, and
-                // offering one would invite them to store a credential that this
-                // provider mints for itself and that expires within hours.
-                Text(
-                    text =
-                        if (connection.source == CredentialSource.BROKERED) {
-                            "Authorised by your BOSS sign-in. A short-lived key is fetched " +
-                                "when needed and never stored."
-                        } else {
-                            "Sign in to BOSS with an account that has access. This provider " +
-                                "has no API key to enter."
-                        },
-                    style = SecretPanelType.meta,
-                    color = BossThemeColors.TextSecondary,
-                )
-                BossSecondaryButton(
-                    text = "Check access",
-                    onClick = { viewModel.refreshBrokeredCredential(descriptor.id) },
-                    enabled = !busy,
-                )
-            } else if (fromEnvironment) {
-                Text(
-                    text =
-                        "This key comes from the environment" +
-                            (connection.label?.let { " ($it)" } ?: "") +
-                            " and is read-only here. Unset it to manage the key in BOSS.",
-                    style = SecretPanelType.meta,
-                    color = BossThemeColors.TextSecondary,
-                )
-            } else {
-                // A stored key is never rendered back — the field is for replacing
-                // it. Settings has no business displaying credential material.
-                BossTextField(
-                    value = state.keyDrafts[descriptor.id].orEmpty(),
-                    onValueChange = { viewModel.updateKeyDraft(descriptor.id, it) },
-                    label = "API key",
-                    placeholder =
-                        if (connection.source == CredentialSource.STORED) {
-                            "A key is stored — enter a new one to replace it"
-                        } else {
-                            descriptor.keyPlaceholder
-                        },
-                    enabled = state.storeAvailable && !busy,
-                    singleLine = true,
-                )
-
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    BossPrimaryButton(
-                        text = "Save key",
-                        onClick = { viewModel.saveKey(descriptor.id) },
-                        enabled = state.storeAvailable && !busy &&
-                            state.keyDrafts[descriptor.id]?.isNotBlank() == true,
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (showTitle) {
+                    Text(
+                        text = descriptor.displayName,
+                        style = SecretPanelType.bodyStrong,
+                        color = BossThemeColors.TextPrimary,
+                        modifier = Modifier.weight(1f),
                     )
-                    if (connection.source == CredentialSource.STORED) {
-                        BossSecondaryButton(
-                            text = "Remove",
-                            onClick = { viewModel.clearKey(descriptor.id) },
-                            enabled = !busy,
-                            isDestructive = true,
+                } else {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+                BossSecondaryButton(text = "Cancel", onClick = onCancel, enabled = !busy)
+            }
+
+            if (ollamaBlocked) {
+                // Nothing below this is reachable: no key to enter, no model list worth
+                // fetching, no activate button that could ever resolve a credential.
+                OllamaUnavailableContent(info = state.ollamaSystemInfo)
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    if (brokered) {
+                        // No key field at all: there is nothing for the user to paste, and
+                        // offering one would invite them to store a credential that this
+                        // provider mints for itself and that expires within hours.
+                        Text(
+                            text =
+                                if (connection.source == CredentialSource.BROKERED) {
+                                    "Authorised by your BOSS sign-in. A short-lived key is fetched " +
+                                        "when needed and never stored."
+                                } else {
+                                    "Sign in to BOSS with an account that has access. This provider " +
+                                        "has no API key to enter."
+                                },
+                            style = SecretPanelType.meta,
+                            color = BossThemeColors.TextSecondary,
                         )
-                    }
-                    if (descriptor.consoleUrl != null) {
                         BossSecondaryButton(
-                            text = "Get API key",
-                            onClick = { viewModel.openProviderConsole(descriptor.id) },
+                            text = "Check access",
+                            onClick = { viewModel.refreshBrokeredCredential(descriptor.id) },
                             enabled = !busy,
+                        )
+                    } else if (fromEnvironment) {
+                        Text(
+                            text =
+                                "This key comes from the environment" +
+                                    (connection.label?.let { " ($it)" } ?: "") +
+                                    " and is read-only here. Unset it to manage the key in BOSS.",
+                            style = SecretPanelType.meta,
+                            color = BossThemeColors.TextSecondary,
+                        )
+                    } else if (noKeyNeeded) {
+                        // Ollama takes no credential on the wire, so there is nothing to
+                        // paste and no "Save key" flow to offer — offering one would just
+                        // invite a dummy value nobody needs.
+                        OllamaSetupNotice(
+                            info = state.ollamaSystemInfo,
+                            installingTag = state.installingOllamaModelTag,
+                            onInstall = viewModel::openOllamaInstallPage,
+                            onInstallModel = viewModel::installOllamaModel,
+                        )
+                    } else {
+                        // A stored key is never rendered back — the field is for replacing
+                        // it. Settings has no business displaying credential material.
+                        BossTextField(
+                            value = state.keyDrafts[descriptor.id].orEmpty(),
+                            onValueChange = { viewModel.updateKeyDraft(descriptor.id, it) },
+                            label = "API key",
+                            placeholder =
+                                if (connection.source == CredentialSource.STORED) {
+                                    "A key is stored — enter a new one to replace it"
+                                } else {
+                                    descriptor.keyPlaceholder
+                                },
+                            enabled = state.storeAvailable && !busy,
+                            singleLine = true,
+                        )
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            BossPrimaryButton(
+                                text = "Save key",
+                                onClick = { viewModel.saveKey(descriptor.id) },
+                                enabled = state.storeAvailable && !busy &&
+                                    state.keyDrafts[descriptor.id]?.isNotBlank() == true,
+                            )
+                            if (connection.source == CredentialSource.STORED) {
+                                BossSecondaryButton(
+                                    text = "Remove",
+                                    onClick = { viewModel.clearKey(descriptor.id) },
+                                    enabled = !busy,
+                                    isDestructive = true,
+                                )
+                            }
+                            if (descriptor.consoleUrl != null) {
+                                BossSecondaryButton(
+                                    text = "Get API key",
+                                    onClick = { viewModel.openProviderConsole(descriptor.id) },
+                                    enabled = !busy,
+                                )
+                            }
+                        }
+                    }
+
+                    if (descriptor.envVarNames.isNotEmpty() && !fromEnvironment && !brokered) {
+                        Text(
+                            text = "Or set ${descriptor.envVarNames.joinToString(" / ")} in the environment.",
+                            style = SecretPanelType.caption,
+                            color = BossThemeColors.TextMuted,
                         )
                     }
                 }
-            }
 
-            if (descriptor.envVarNames.isNotEmpty() && !fromEnvironment && !brokered) {
-                Text(
-                    text = "Or set ${descriptor.envVarNames.joinToString(" / ")} in the environment.",
-                    style = SecretPanelType.caption,
-                    color = BossThemeColors.TextMuted,
+                ModelSectionContent(
+                    descriptor = descriptor,
+                    connection = connection,
+                    catalog = state.catalogOf(descriptor.id),
+                    busy = busy,
+                    onSelectModel = { viewModel.selectModel(descriptor.id, it) },
+                    onRefresh = { viewModel.refreshModels(descriptor.id) },
+                    onTest = { viewModel.testConnection(descriptor.id) },
+                    onEndpointChange = { viewModel.setCustomEndpoint(descriptor.id, it) },
+                    onManualModelChange = { viewModel.setManualModelId(descriptor.id, it) },
                 )
+
+                if (connection.isConfigured && descriptor.id != state.activeProviderId) {
+                    BossSecondaryButton(
+                        text = "Use ${descriptor.displayName} for AI features",
+                        onClick = { viewModel.setActiveProvider(descriptor.id) },
+                        enabled = !busy,
+                    )
+                }
             }
         }
+    }
+}
 
-        Spacer(modifier = Modifier.height(12.dp))
-
-        ModelSection(
-            descriptor = descriptor,
-            connection = connection,
-            catalog = state.catalogOf(descriptor.id),
-            busy = busy,
-            onSelectModel = { viewModel.selectModel(descriptor.id, it) },
-            onRefresh = { viewModel.refreshModels(descriptor.id) },
-            onTest = { viewModel.testConnection(descriptor.id) },
-            onEndpointChange = { viewModel.setCustomEndpoint(descriptor.id, it) },
-            onManualModelChange = { viewModel.setManualModelId(descriptor.id, it) },
+/** What replaces the rest of the card when [OllamaSystemInfo.meetsMinimum] is false. */
+@Composable
+private fun OllamaUnavailableContent(info: OllamaSystemInfo?) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = "Not available on this machine",
+            style = SecretPanelType.bodyStrong,
+            color = BossThemeColors.TextPrimary,
         )
+        Text(
+            text =
+                "This machine reports " +
+                    (info?.totalRamGb?.let { "about ${it.roundToInt()} GB" } ?: "an unreadable amount") +
+                    " of RAM. Ollama needs at least ${OllamaSystemCheck.MIN_USABLE_RAM_GB.roundToInt()} GB " +
+                    "to run any model usefully, so this provider isn't offered here.",
+            style = SecretPanelType.meta,
+            color = BossThemeColors.TextSecondary,
+        )
+    }
+}
 
-        if (connection.isConfigured && descriptor.id != state.activeProviderId) {
-            Spacer(modifier = Modifier.height(12.dp))
-            BossSecondaryButton(
-                text = "Use ${descriptor.displayName} for AI features",
-                onClick = { viewModel.setActiveProvider(descriptor.id) },
-                enabled = !busy,
+/**
+ * What the key section shows for Ollama once it's confirmed to be worth offering at all:
+ * whether the binary is here yet, and — either way — a picker over a short, RAM-sized
+ * shortlist that pulls a model by calling Ollama's own API, not by naming a terminal command
+ * and hoping the user comes back and runs it. The live model picker below this only ever
+ * shows models already pulled, so getting one pulled from here is the whole point of this
+ * over the generic message every other keyless provider would get.
+ */
+@Composable
+private fun OllamaSetupNotice(
+    info: OllamaSystemInfo?,
+    installingTag: String?,
+    onInstall: () -> Unit,
+    onInstallModel: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        when {
+            // Null is "the probe has not answered". Say so, rather than picking one of the
+            // two real answers and being wrong about it for a frame — the same reason
+            // CliEngineHealth has an Unknown and does not default to NotInstalled.
+            info == null ->
+                Text(
+                    text = "Checking whether Ollama is installed…",
+                    style = SecretPanelType.meta,
+                    color = BossThemeColors.TextMuted,
+                )
+            !info.binaryFound -> {
+                Text(
+                    text = "Ollama doesn't appear to be installed on this machine.",
+                    style = SecretPanelType.meta,
+                    color = BossThemeColors.TextSecondary,
+                )
+                BossSecondaryButton(text = "Install Ollama", onClick = onInstall)
+            }
+            else ->
+                Text(
+                    text = "A local Ollama daemon needs no API key. Pick a model below once it's running.",
+                    style = SecretPanelType.meta,
+                    color = BossThemeColors.TextSecondary,
+                )
+        }
+
+        if (info != null && info.suggestedModels.isNotEmpty()) {
+            Text(
+                text =
+                    "Suggested for this machine" +
+                        (info.totalRamGb?.let { " (~${it.roundToInt()} GB RAM)" } ?: "") + ":",
+                style = SecretPanelType.caption,
+                color = BossThemeColors.TextMuted,
+            )
+            OllamaModelInstallPicker(
+                models = info.suggestedModels,
+                installingTag = installingTag,
+                // Pulling before the binary is here is a guaranteed connection-refused, so
+                // the control that would do it is disabled rather than left to fail and
+                // explain itself. Install Ollama above is the step that comes first.
+                enabled = info.binaryFound,
+                onInstall = onInstallModel,
             )
         }
     }
 }
 
+/**
+ * A model picker paired with an Install button, rather than a list of `ollama pull` commands
+ * to copy into a terminal — [onInstall] calls Ollama's own API directly. The dropdown mirrors
+ * [ModelPicker]'s shape so the two read as the same control at different points in the flow.
+ */
 @Composable
-private fun ModelSection(
+private fun OllamaModelInstallPicker(
+    models: List<SuggestedOllamaModel>,
+    installingTag: String?,
+    enabled: Boolean,
+    onInstall: (String) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    var chosen by remember(models) { mutableStateOf(models.firstOrNull()) }
+    val busy = installingTag != null || !enabled
+
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Box(modifier = Modifier.weight(1f)) {
+            Row(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(BossThemeColors.BackgroundColor)
+                        .border(1.dp, BossThemeColors.BorderColor, RoundedCornerShape(6.dp))
+                        .clickable(enabled = !busy) { expanded = true }
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = chosen?.tag ?: "Select a model",
+                        style = SecretPanelType.body,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (chosen == null) BossThemeColors.TextMuted else BossThemeColors.TextPrimary,
+                    )
+                    chosen?.let {
+                        Text(text = it.note, style = SecretPanelType.caption, color = BossThemeColors.TextMuted)
+                    }
+                }
+                Icon(
+                    imageVector = Icons.Filled.ArrowDropDown,
+                    contentDescription = null,
+                    tint = BossThemeColors.TextSecondary,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier.heightIn(max = 320.dp).background(BossThemeColors.SurfaceColor),
+            ) {
+                models.forEach { model ->
+                    DropdownMenuItem(
+                        onClick = {
+                            expanded = false
+                            chosen = model
+                        },
+                    ) {
+                        Column {
+                            Text(
+                                text = model.tag,
+                                style = SecretPanelType.body,
+                                fontFamily = FontFamily.Monospace,
+                                color = BossThemeColors.TextPrimary,
+                            )
+                            Text(text = model.note, style = SecretPanelType.caption, color = BossThemeColors.TextMuted)
+                        }
+                    }
+                }
+            }
+        }
+
+        BossPrimaryButton(
+            text = if (installingTag != null && installingTag == chosen?.tag) "Installing…" else "Install",
+            onClick = { chosen?.let { onInstall(it.tag) } },
+            enabled = !busy && chosen != null,
+        )
+    }
+}
+
+@Composable
+private fun ModelSectionContent(
     descriptor: ProviderDescriptor,
     connection: ProviderConnection,
     catalog: CatalogState,
@@ -518,119 +878,125 @@ private fun ModelSection(
     onEndpointChange: (String) -> Unit,
     onManualModelChange: (String) -> Unit,
 ) {
-    BossCard {
-        Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "Model",
+                style = SecretPanelType.body,
+                fontWeight = FontWeight.Medium,
+                color = BossThemeColors.TextPrimary,
+                modifier = Modifier.weight(1f),
+            )
+            if (busy) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(14.dp),
+                    color = BossThemeColors.AccentColor,
+                    strokeWidth = 2.dp,
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+            }
+            if (descriptor.modelsEndpoint != null && connection.isConfigured) {
+                Icon(
+                    imageVector = Icons.Outlined.Refresh,
+                    contentDescription = "Refresh model list",
+                    tint = BossThemeColors.TextSecondary,
+                    modifier =
+                        Modifier
+                            .size(16.dp)
+                            .clickable(enabled = !busy, onClick = onRefresh),
+                )
+            }
+        }
+
+        when {
+            // No models endpoint (a custom/self-hosted runtime): there is nothing
+            // authoritative to ask, so the endpoint and model id are typed in. Without
+            // these two fields a custom provider could be given a key and still never
+            // be usable, because activeConfig() requires both.
+            ProviderRegistry.needsManualModel(descriptor) -> {
                 Text(
-                    text = "Model",
-                    style = SecretPanelType.body,
-                    fontWeight = FontWeight.Medium,
-                    color = BossThemeColors.TextPrimary,
-                    modifier = Modifier.weight(1f),
+                    text =
+                        "${descriptor.displayName} has no model list to query — " +
+                            "enter the endpoint and the model id it expects.",
+                    style = SecretPanelType.meta,
+                    color = BossThemeColors.TextSecondary,
                 )
-                if (busy) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(14.dp),
-                        color = BossThemeColors.AccentColor,
-                        strokeWidth = 2.dp,
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                }
-                if (descriptor.modelsEndpoint != null && connection.isConfigured) {
-                    Icon(
-                        imageVector = Icons.Outlined.Refresh,
-                        contentDescription = "Refresh model list",
-                        tint = BossThemeColors.TextSecondary,
-                        modifier =
-                            Modifier
-                                .size(16.dp)
-                                .clickable(enabled = !busy, onClick = onRefresh),
-                    )
-                }
-            }
-
-            when {
-                // No models endpoint (a custom/self-hosted runtime): there is nothing
-                // authoritative to ask, so the endpoint and model id are typed in. Without
-                // these two fields a custom provider could be given a key and still never
-                // be usable, because activeConfig() requires both.
-                ProviderRegistry.needsManualModel(descriptor) -> {
-                    Text(
-                        text =
-                            "${descriptor.displayName} has no model list to query — " +
-                                "enter the endpoint and the model id it expects.",
-                        style = SecretPanelType.meta,
-                        color = BossThemeColors.TextSecondary,
-                    )
-                    ManualEndpointAndModel(
-                        connection = connection,
-                        enabled = !busy,
-                        onEndpointCommit = onEndpointChange,
-                        onModelCommit = onManualModelChange,
-                    )
-                }
-
-                catalog is CatalogState.NotConfigured ->
-                    Text(
-                        text = "Add an API key to load ${descriptor.displayName}'s models.",
-                        style = SecretPanelType.meta,
-                        color = BossThemeColors.TextSecondary,
-                    )
-
-                catalog is CatalogState.Loading ->
-                    Text(
-                        text = "Loading models from ${descriptor.displayName}…",
-                        style = SecretPanelType.meta,
-                        color = BossThemeColors.TextSecondary,
-                    )
-
-                else -> {
-                    val loaded =
-                        when (catalog) {
-                            is CatalogState.Loaded -> catalog
-                            is CatalogState.Failed -> catalog.lastKnown
-                            else -> null
-                        }
-
-                    if (catalog is CatalogState.Failed) {
-                        Text(
-                            text = catalog.message,
-                            style = SecretPanelType.meta,
-                            color = BossThemeColors.ErrorColor,
-                        )
-                    }
-
-                    if (loaded == null) {
-                        Text(
-                            text = "No models available yet.",
-                            style = SecretPanelType.meta,
-                            color = BossThemeColors.TextSecondary,
-                        )
-                    } else {
-                        ModelPicker(
-                            models = loaded.models,
-                            selectedModelId = connection.selectedModelId,
-                            enabled = !busy,
-                            onSelect = onSelectModel,
-                        )
-                        FreshnessLine(loaded)
-                        loaded.models
-                            .firstOrNull { it.id == connection.selectedModelId }
-                            ?.let { ModelFacts(it) }
-                    }
-                }
-            }
-
-            if (connection.isConfigured && descriptor.modelsEndpoint != null) {
-                BossSecondaryButton(
-                    text = "Test connection",
-                    onClick = onTest,
+                ManualEndpointAndModel(
+                    connection = connection,
                     enabled = !busy,
+                    onEndpointCommit = onEndpointChange,
+                    onModelCommit = onManualModelChange,
                 )
             }
+
+            catalog is CatalogState.NotConfigured ->
+                Text(
+                    text = "Add an API key to load ${descriptor.displayName}'s models.",
+                    style = SecretPanelType.meta,
+                    color = BossThemeColors.TextSecondary,
+                )
+
+            catalog is CatalogState.Loading ->
+                Text(
+                    text = "Loading models from ${descriptor.displayName}…",
+                    style = SecretPanelType.meta,
+                    color = BossThemeColors.TextSecondary,
+                )
+
+            else -> {
+                val loaded =
+                    when (catalog) {
+                        is CatalogState.Loaded -> catalog
+                        is CatalogState.Failed -> catalog.lastKnown
+                    }
+
+                if (catalog is CatalogState.Failed) {
+                    Text(
+                        text = catalog.message,
+                        style = SecretPanelType.meta,
+                        color = BossThemeColors.ErrorColor,
+                    )
+                }
+
+                if (loaded == null) {
+                    Text(
+                        text = "No models available yet.",
+                        style = SecretPanelType.meta,
+                        color = BossThemeColors.TextSecondary,
+                    )
+                } else if (loaded.models.isEmpty()) {
+                    Text(
+                        text = "${descriptor.displayName} reported no installed or available models.",
+                        style = SecretPanelType.meta,
+                        color = BossThemeColors.TextSecondary,
+                    )
+                } else {
+                    Text(
+                        text = "Default for apps that don't pick a model themselves. " +
+                            "Those apps need a selection here; agents can choose their own models.",
+                        style = SecretPanelType.meta,
+                        color = BossThemeColors.TextSecondary,
+                    )
+                    ModelPicker(
+                        models = loaded.models,
+                        selectedModelId = connection.selectedModelId,
+                        enabled = !busy,
+                        onSelect = onSelectModel,
+                    )
+                    FreshnessLine(loaded)
+                    loaded.models
+                        .firstOrNull { it.id == connection.selectedModelId }
+                        ?.let { ModelFacts(it) }
+                }
+            }
+        }
+
+        if (connection.isConfigured && descriptor.modelsEndpoint != null) {
+            BossSecondaryButton(
+                text = "Test connection",
+                onClick = onTest,
+                enabled = !busy,
+            )
         }
     }
 }
@@ -736,12 +1102,16 @@ private fun ModelFacts(model: AiModel) {
             if (model.capabilities.isNotEmpty()) add(model.capabilities.joinToString(", "))
             model.ownedBy?.let { add(it) }
         }
-    if (facts.isEmpty()) return
-    Text(
-        text = facts.joinToString(" · "),
-        style = SecretPanelType.caption,
-        color = BossThemeColors.TextSecondary,
-    )
+    if (facts.isNotEmpty()) {
+        Text(
+            text = facts.joinToString(" · "),
+            style = SecretPanelType.caption,
+            color = BossThemeColors.TextSecondary,
+        )
+    }
+    model.allowanceSummary?.let {
+        Text(text = it, style = SecretPanelType.caption, color = BossThemeColors.TextSecondary)
+    }
 }
 
 private fun formatTokens(tokens: Int): String =

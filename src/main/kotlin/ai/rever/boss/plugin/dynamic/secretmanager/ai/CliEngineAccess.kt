@@ -4,12 +4,8 @@ package ai.rever.boss.plugin.dynamic.secretmanager.ai
  * The local agent CLIs, as this panel needs to see them.
  *
  * A plugin-local mirror of the AI Gateway's `AiCliSessionAPI`, and the types below mirror its
- * types, for exactly the reason [WireFormat] gives for not using `LlmApiFormat`: referencing
- * a new-api symbol from the panel's own code puts it on a path that runs whenever the panel
- * loads, so a host serving an older api jar would fail to link the whole settings page. Every
- * such reference stays inside the one adapter that implements this, which is created inside a
- * `LinkageError` guard - so an older host loses the Local CLI section and keeps everything
- * else.
+ * types. Keeping every host reference inside one adapter makes the panel independently testable
+ * and limits an incoherent optional-gateway installation to the Local CLI section.
  *
  * It exists at all because a CLI engine cannot be a [ProviderDescriptor]: there is no
  * endpoint, no credential, and nothing for the user to paste. What it offers is the auth they

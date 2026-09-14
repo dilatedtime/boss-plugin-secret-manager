@@ -20,6 +20,8 @@ object ProviderRegistry {
     const val MOONSHOT: String = "MOONSHOT"
     const val TOGETHER: String = "TOGETHER"
     const val CUSTOM: String = "CUSTOM"
+    const val OPENROUTER: String = "OPENROUTER"
+    const val OLLAMA: String = "OLLAMA"
     const val RISA_GLM: String = "RISA_GLM"
 
     /** Broker id the host resolves to RISA's token endpoint. */
@@ -130,6 +132,51 @@ object ProviderRegistry {
         )
 
     /**
+     * OpenRouter: one Bearer-key OpenAI-compatible endpoint in front of most hosted
+     * model families. Its `/v1/models` list is public (no key required to read it,
+     * though a key is still needed to complete), and reports `context_length`
+     * directly on each entry, so it gets its own parser in [ModelCatalogClient]
+     * rather than falling through to the bare-id [ModelCatalogClient.openAiModel].
+     */
+    private val openRouter =
+        ProviderDescriptor(
+            id = OPENROUTER,
+            displayName = "OpenRouter",
+            wireFormat = WireFormat.OPENAI_CHAT,
+            credentialTransport = CredentialTransport.BEARER_HEADER,
+            chatEndpoint = "https://openrouter.ai/api/v1/chat/completions",
+            modelsEndpoint = "https://openrouter.ai/api/v1/models",
+            envVarNames = listOf("OPENROUTER_API_KEY"),
+            consoleUrl = "https://openrouter.ai/keys",
+            keyPlaceholder = "sk-or-v1-...",
+        )
+
+    /**
+     * A local Ollama daemon, reached through its OpenAI-compatible endpoint on the
+     * default port. No credential of any kind: [requiresApiKey] is false, so
+     * [ProviderConnection.isConfigured] does not wait on a key nobody needs to type,
+     * and [ModelCatalog] fetches the model list — whatever the user has pulled —
+     * with a blank one.
+     *
+     * Fixed at `localhost:11434`, not user-editable: unlike [custom] there is a
+     * correct default here, and this provider exists so that default just works.
+     * Ollama on another host or port remains reachable through [custom].
+     */
+    private val ollama =
+        ProviderDescriptor(
+            id = OLLAMA,
+            displayName = "Ollama (local)",
+            wireFormat = WireFormat.OPENAI_CHAT,
+            credentialTransport = CredentialTransport.BEARER_HEADER,
+            chatEndpoint = "http://localhost:11434/v1/chat/completions",
+            modelsEndpoint = "http://localhost:11434/v1/models",
+            envVarNames = emptyList(),
+            consoleUrl = null,
+            keyPlaceholder = "",
+            requiresApiKey = false,
+        )
+
+    /**
      * RISA's own Codex GLM deployment, reached through the organisation gateway.
      *
      * The only provider here with nothing for the user to fill in: being signed in to
@@ -179,7 +226,10 @@ object ProviderRegistry {
      *
      * `custom` sits with the open group on purpose — it is how you point BOSS at a local
      * or self-hosted OpenAI-compatible runtime (Ollama, vLLM, llama.cpp), which is the
-     * most open option available here.
+     * most open option available here. `ollama` and `openRouter` sit right next to it
+     * for the same reason: a named preset for the common local daemon and the common
+     * multi-model router, with `custom` still there for anything either doesn't cover
+     * (Ollama on a non-default host, or another self-hosted runtime).
      *
      * `risaGlm` is second, not first, and that placement is load-bearing: [default] is
      * `all.first()`, so leading with it would make an organisation-only provider the
@@ -187,7 +237,26 @@ object ProviderRegistry {
      * outside RISA, for whom it can never resolve a credential.
      */
     val all: List<ProviderDescriptor> =
-        listOf(together, risaGlm, moonshot, custom, xai, anthropic, openai, google)
+        listOf(together, risaGlm, moonshot, custom, ollama, openRouter, xai, anthropic, openai, google)
+
+    /**
+     * The providers a user can hand this plugin a key for — everything the secrets section's
+     * "Add AI provider key" dialog may offer.
+     *
+     * Two kinds are excluded, for different reasons, and both were reachable through that
+     * dialog before this list existed:
+     *
+     * - a **keyless** provider ([ProviderDescriptor.requiresApiKey] false). Ollama has nothing
+     *   to store; picking it wrote an `OLLAMA_API_KEY` into the vault that nothing would ever
+     *   read, while the AI row went on correctly saying "No key needed" beside it. Worse, its
+     *   endpoint is plain `http://` with a bearer transport, so a stray stored key would be
+     *   sent in cleartext for no reason at all.
+     * - a **brokered** provider ([ProviderDescriptor.brokerId] non-null). RISA Codex GLM mints
+     *   its own short-lived credential from the BOSS sign-in, and the rule everywhere else in
+     *   this plugin is that a brokered credential is never written to disk — a dialog that
+     *   invites the user to type one in is the one place that rule was still reachable.
+     */
+    val userKeyed: List<ProviderDescriptor> = all.filter { it.requiresApiKey && it.brokerId == null }
 
     private val byId: Map<String, ProviderDescriptor> = all.associateBy { it.id }
 

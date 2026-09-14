@@ -63,6 +63,13 @@ enum class CredentialTransport {
     QUERY_KEY_PARAM,
 }
 
+/** Trust-neutral source ordering for competing shared default recommendations. */
+enum class SharedProviderProvenance {
+    OWNED,
+    ORGANISATION,
+    DIRECT_SHARE,
+}
+
 /**
  * Static description of one AI provider: where its endpoints are, how it wants the
  * credential, and where a user goes to obtain one.
@@ -108,6 +115,15 @@ data class ProviderDescriptor(
     /** How [modelsEndpoint] pages, so a long list isn't silently clipped. */
     val pagingStyle: PagingStyle = PagingStyle.NONE,
     /**
+     * Whether this provider needs a credential at all before it can be used.
+     *
+     * True for every hosted provider. False only for a local daemon (Ollama) that
+     * takes no key on the wire: [ProviderConnection.isConfigured] does not wait on
+     * one, and [ModelCatalog] fetches its model list with a blank key rather than
+     * reporting [CatalogState.NotConfigured] forever.
+     */
+    val requiresApiKey: Boolean = true,
+    /**
      * Broker that mints this provider's credential from the signed-in BOSS session,
      * or null for a provider the user supplies a key for.
      *
@@ -117,7 +133,17 @@ data class ProviderDescriptor(
      * provider reports unconfigured on a host that does not.
      */
     val brokerId: String? = null,
+    /** Default recommendation supplied by managed provider metadata. */
+    val sharedDefault: Boolean = false,
+    /** Untrusted provenance label shown for a vault-delivered definition. */
+    val sharedSourceLabel: String? = null,
+    /** Typed provenance used for deterministic default ordering, never as authorization. */
+    val sharedProvenance: SharedProviderProvenance? = null,
 ) {
+    /** Whether a model id is embedded into [chatEndpoint] rather than sent in the body. */
+    val needsModelInEndpoint: Boolean
+        get() = wireFormat == WireFormat.GOOGLE_GENERATIVE
+
     /**
      * Canonical name for this provider's key, used as the stored secret's name so an
      * entry reads as `TOGETHER_API_KEY` rather than a prose label.
@@ -134,10 +160,47 @@ data class ProviderDescriptor(
      * every other provider takes it in the request body and ignores the argument.
      */
     fun chatEndpointFor(modelId: String): String =
-        when (wireFormat) {
-            WireFormat.GOOGLE_GENERATIVE -> "$chatEndpoint/$modelId:generateContent"
-            else -> chatEndpoint
-        }
+        if (needsModelInEndpoint) "$chatEndpoint/$modelId:generateContent" else chatEndpoint
+}
+
+/**
+ * Whether [descriptor] belongs in the compact provider list shared by the panel and API.
+ *
+ * Keyed providers need a credential. A keyless local daemon instead needs a catalog that
+ * proves it is reachable. Without that distinction every user would see Ollama from first
+ * launch whether or not they had ever run it.
+ *
+ * [wasAddedByUser] deliberately overrides the daemon rule for the current panel session. A
+ * user who adds Ollama before installing it must keep the row and its install controls after
+ * closing the editor; the catalog rule takes over again on the next launch.
+ */
+internal fun isProviderListed(
+    descriptor: ProviderDescriptor,
+    connection: ProviderConnection,
+    catalog: CatalogState,
+    wasAddedByUser: Boolean = false,
+): Boolean =
+    if (isManagedProvider(descriptor.id)) {
+        connection.isConfigured && usableSharedCatalog(catalog) != null
+    } else if (descriptor.requiresApiKey) {
+        connection.isConfigured
+    } else {
+        catalog is CatalogState.Loaded || wasAddedByUser
+    }
+
+/** Pure connection-shape check for credential-free discovery responses. */
+internal fun hasUsableProviderConnection(
+    descriptor: ProviderDescriptor,
+    connection: ProviderConnection,
+    requireModel: Boolean,
+): Boolean {
+    if (!connection.isConfigured) return false
+    val modelId = connection.selectedModelId.orEmpty().trim()
+    if (requireModel && modelId.isEmpty()) return false
+    if (descriptor.needsModelInEndpoint && modelId.isEmpty()) return false
+    if (ProviderRegistry.needsManualModel(descriptor) && modelId.isEmpty()) return false
+    if (descriptor.id == ProviderRegistry.CUSTOM && connection.customEndpoint.isNullOrBlank()) return false
+    return true
 }
 
 /**
@@ -158,6 +221,10 @@ data class AiModel(
     val capabilities: List<String> = emptyList(),
     /** Owning organisation, when reported. */
     val ownedBy: String? = null,
+    /** Published by BOSS AI; never inferred from display order. */
+    val isDefault: Boolean = false,
+    /** Server-reported remaining allowance and UTC reset times. */
+    val allowanceSummary: String? = null,
 )
 
 /** Where a provider's credential came from, which decides whether it is editable. */
@@ -213,6 +280,17 @@ data class BrokeredKey(
  */
 fun interface BrokeredKeySource {
     suspend fun fetch(brokerId: String): Result<BrokeredKey>
+    /** The plugin credential source opts into the BOSS provider metadata protocol. */
+    val discoversBossAi: Boolean get() = false
+    fun bossAiScope(): String? = null
+    val supportsSharedProviders: Boolean get() = false
+    /** Whether this host currently exposes at least one scoped broker. */
+    fun canDiscoverSharedProviders(): Boolean = supportsSharedProviders
+    /** Host-owned destination check, mandatory for descriptors read from shared notes. */
+    fun permitsEndpoint(brokerId: String, endpoint: String): Boolean = false
+    /** Check one definition against a single snapshot of the host broker registry. */
+    fun permitsEndpoints(brokerId: String, endpoints: List<String>): Boolean =
+        endpoints.all { permitsEndpoint(brokerId, it) }
 }
 
 /**
@@ -231,14 +309,17 @@ data class ProviderConnection(
     val label: String? = null,
 ) {
     /**
-     * A local runtime (Ollama, vLLM, llama.cpp) needs no credential, so for [CUSTOM] an
-     * endpoint alone counts. Requiring a key there forced users to invent a dummy one to
-     * make `activeConfig()` resolve at all.
+     * A local runtime needs no credential. For [ProviderRegistry.CUSTOM] an endpoint
+     * alone counts — requiring a key there forced users to invent a dummy one to make
+     * `activeConfig()` resolve at all. For any provider whose descriptor declares
+     * [ProviderDescriptor.requiresApiKey] false (Ollama, at a fixed endpoint it never
+     * needs to be told), no further input is needed at all.
      */
     val isConfigured: Boolean
         get() =
             apiKey.isNotBlank() ||
-                (providerId == ProviderRegistry.CUSTOM && !customEndpoint.isNullOrBlank())
+                (providerId == ProviderRegistry.CUSTOM && !customEndpoint.isNullOrBlank()) ||
+                ProviderRegistry.find(providerId)?.requiresApiKey == false
 
     companion object {
         const val DEFAULT_TEMPERATURE: Float = 0.7f
@@ -286,5 +367,7 @@ sealed interface CatalogState {
          * attempt genuinely might succeed.
          */
         val permanent: Boolean = false,
+        /** When the failed request finished, used to bound retries of transient failures. */
+        val failedAtEpochMs: Long = 0,
     ) : CatalogState
 }

@@ -1,38 +1,28 @@
 package ai.rever.boss.plugin.dynamic.secretmanager.ai
 
+import java.io.ByteArrayInputStream
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * An [HttpClient] that serves canned responses in order and records every request URI.
+ * Minimal `HttpClient` stub for the local-Ollama paths, answering by request path.
  *
- * Shared by the paging and catalog tests because a *queue* is what makes multi-request
- * behaviour reachable at all — cursor-following, the page cap, the primary-then-fallback
- * path, and any test that needs one genuinely successful fetch to exercise a write path.
- * Once [responses] is exhausted it serves [always], or repeats the last response.
+ * Shared rather than nested in one suite because two different callers reach the same fake
+ * daemon with two different body handlers: [OllamaModelInstaller] streams `/api/pull` with
+ * `BodyHandlers.ofInputStream()`, while [ModelCatalogClient] reads `/v1/models` with
+ * `ofString()`. A stub that answers only one of them cannot stand in for a ViewModel test
+ * that exercises a pull *and* the catalog refresh it triggers.
  */
-internal class QueuedHttpClient(
-    private val responses: List<Pair<Int, String>>,
-    private val always: Pair<Int, String>? = null,
-    private val beforeResponse: (HttpRequest) -> Unit = {},
+internal class FakeStreamingHttpClient(
+    /** NDJSON returned for `/api/pull`, as an `InputStream`. */
+    private val pullBody: String = """{"status":"success"}""",
+    /** JSON returned for anything else, as a `String`. */
+    private val catalogBody: String = """{"data":[]}""",
+    private val status: Int = 200,
+    private val onRequest: (HttpRequest) -> Unit = {},
 ) : HttpClient() {
-    val requests = CopyOnWriteArrayList<String>()
-    private val nextResponse = AtomicInteger()
-
-    private fun next(request: HttpRequest): Pair<Int, String> {
-        val index = nextResponse.getAndIncrement()
-        requests += request.uri().toString()
-        beforeResponse(request)
-        return responses.getOrNull(index)
-            ?: always
-            ?: responses.lastOrNull()
-            ?: (200 to "{}")
-    }
-
     override fun cookieHandler() = java.util.Optional.empty<java.net.CookieHandler>()
 
     override fun connectTimeout() = java.util.Optional.empty<java.time.Duration>()
@@ -51,13 +41,20 @@ internal class QueuedHttpClient(
 
     override fun executor() = java.util.Optional.empty<java.util.concurrent.Executor>()
 
+    private fun bodyFor(request: HttpRequest): Any =
+        if (request.uri().path.startsWith("/api/pull")) {
+            ByteArrayInputStream(pullBody.toByteArray())
+        } else {
+            catalogBody
+        }
+
     @Suppress("UNCHECKED_CAST")
     override fun <T : Any?> send(
         request: HttpRequest,
         responseBodyHandler: HttpResponse.BodyHandler<T>,
     ): HttpResponse<T> {
-        val (status, body) = next(request)
-        return QueuedResponse(status, body, request) as HttpResponse<T>
+        onRequest(request)
+        return FakeResponse(status, bodyFor(request), request) as HttpResponse<T>
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -65,8 +62,8 @@ internal class QueuedHttpClient(
         request: HttpRequest,
         responseBodyHandler: HttpResponse.BodyHandler<T>,
     ): CompletableFuture<HttpResponse<T>> {
-        val (status, body) = next(request)
-        return CompletableFuture.completedFuture(QueuedResponse(status, body, request) as HttpResponse<T>)
+        onRequest(request)
+        return CompletableFuture.completedFuture(FakeResponse(status, bodyFor(request), request) as HttpResponse<T>)
     }
 
     override fun <T : Any?> sendAsync(
@@ -75,20 +72,20 @@ internal class QueuedHttpClient(
         pushPromiseHandler: HttpResponse.PushPromiseHandler<T>?,
     ): CompletableFuture<HttpResponse<T>> = sendAsync(request, responseBodyHandler)
 
-    private class QueuedResponse(
+    private class FakeResponse(
         private val status: Int,
-        private val body: String,
+        private val body: Any,
         private val request: HttpRequest,
-    ) : HttpResponse<String> {
+    ) : HttpResponse<Any> {
         override fun statusCode() = status
 
         override fun request() = request
 
-        override fun previousResponse() = java.util.Optional.empty<HttpResponse<String>>()
+        override fun previousResponse() = java.util.Optional.empty<HttpResponse<Any>>()
 
         override fun headers() = java.net.http.HttpHeaders.of(emptyMap()) { _, _ -> true }
 
-        override fun body() = body
+        override fun body(): Any = body
 
         override fun sslSession() = java.util.Optional.empty<javax.net.ssl.SSLSession>()
 

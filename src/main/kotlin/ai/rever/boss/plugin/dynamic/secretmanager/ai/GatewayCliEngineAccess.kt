@@ -7,10 +7,8 @@ import ai.rever.boss.plugin.api.PluginContext
 /**
  * [CliEngineAccess] backed by the AI Gateway plugin.
  *
- * **The only file in this plugin that names `AiCliSessionAPI`**, which is the point: every
- * new-api reference is confined here so the rest of the panel links on a host whose api jar
- * predates it. Construct it through [orNull], which answers null rather than throwing when
- * that is the case.
+ * **The only file in this plugin that names `AiCliSessionAPI`**. The type predates the
+ * manifest floor, but the adapter keeps the optional gateway boundary narrow and testable.
  *
  * The gateway is resolved **per call, never cached**. Plugin load order is not guaranteed, so
  * a value read once would usually be null forever - and the gateway can be installed, updated
@@ -58,10 +56,8 @@ internal class GatewayCliEngineAccess private constructor(
         /**
          * An adapter, or null when this host cannot serve one.
          *
-         * Null covers both cases a caller cannot act on differently: the gateway is not
-         * installed, or the host's api jar predates `AiCliSessionAPI` so the symbol does not
-         * link. `LinkageError` is caught rather than `Exception` because that is the shape the
-         * second case takes, and it is an `Error`.
+         * Null when the gateway is not installed or an incoherent host installation cannot
+         * link the type. `LinkageError` is caught because it is an `Error`, not an `Exception`.
          */
         fun orNull(context: PluginContext): CliEngineAccess? =
             try {

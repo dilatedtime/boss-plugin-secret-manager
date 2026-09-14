@@ -34,7 +34,6 @@ import androidx.compose.material.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -98,8 +97,8 @@ fun SecretManagerContent(
      * A **supplier**, not the value: it is built inside `registerAiProviderSettings`'s
      * `LinkageError` guard, which runs after `registerPanel`, so anything reading it at
      * registration time would read null forever. Resolved when the section is first shown
-     * instead. Null means the host's api predates `LlmProviderSettingsAPI` (1.0.71), and the tab
-     * is not offered at all - a tab whose only content is "not available here" is noise.
+     * instead. Null means AI settings registration could not link, and the tab is not offered
+     * at all - a tab whose only content is "not available here" is noise.
      */
     aiProvidersViewModel: () -> AiProvidersViewModel? = { null },
 ) {
@@ -397,8 +396,10 @@ private fun SecretManagerView(
                         listState = listState,
                         clipboardManager = clipboardManager,
                         onOpenAiProvider = { providerId ->
-                            aiViewModel?.selectProvider(providerId)
-                            onSelectSection(SecretPanelSection.AI_PROVIDERS)
+                            aiViewModel?.let { model ->
+                                model.selectProvider(providerId)
+                                onSelectSection(SecretPanelSection.AI_PROVIDERS)
+                            }
                         },
                         modifier = Modifier.weight(1f),
                     )
@@ -426,10 +427,6 @@ private fun SecretManagerView(
                     // Guarded anyway rather than asserted, because the day the tab is offered
                     // some other way, a blank section beats a crash inside a credentials panel.
                     aiViewModel?.let { model ->
-                        // First entry is what pays for the CLI probes and the gateway check.
-                        // They used to run from the ViewModel's init, i.e. during register() on
-                        // every launch, for a section most launches never open.
-                        LaunchedEffect(model) { model.ensureSectionLoaded() }
                         AiProvidersPanel(viewModel = model, modifier = Modifier.weight(1f))
                     }
             }
@@ -444,6 +441,8 @@ private fun SecretManagerView(
             isLoading = state.isOperationInProgress
         )
     }
+
+
 
     if (state.showAiProviderKeyDialog) {
         AiProviderKeyDialog(
@@ -688,9 +687,9 @@ private fun SectionTabs(
                 badge = sharedCount,
                 modifier = Modifier.padding(start = 20.dp),
             )
-            // Absent, not disabled, on a host whose api predates LlmProviderSettingsAPI: the
-            // section cannot render there at all, and a tab that only ever says "not available"
-            // is worse than one tab fewer.
+            // Absent, not disabled, when AI settings registration could not link: the section
+            // cannot render there at all, and a tab that only ever says "not available" is worse
+            // than one tab fewer.
             if (showAiSection) {
                 SectionTab(
                     label = "AI",
@@ -2786,7 +2785,9 @@ private fun AiProviderKeyDialog(
                         onDismissRequest = { providerMenuOpen = false },
                         modifier = Modifier.background(BossThemeColors.SurfaceColor)
                     ) {
-                        ProviderRegistry.all.forEach { candidate ->
+                        // userKeyed, not all: a keyless or brokered provider has no key to
+                        // store here. See ProviderRegistry.userKeyed.
+                        ProviderRegistry.userKeyed.forEach { candidate ->
                             DropdownMenuItem(
                                 onClick = {
                                     providerMenuOpen = false

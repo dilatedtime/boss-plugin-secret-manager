@@ -104,6 +104,7 @@ class CliEngineSelectionTest {
             scope = scope,
             envResolver = env,
             cliEngines = cli,
+            ollamaSystemCheck = noOllamaOnThisMachine(),
         )
     }
 
@@ -134,6 +135,7 @@ class CliEngineSelectionTest {
 
         assertEquals(0, cli.engineListReads, "the engine list was read before the section opened")
         assertTrue(vm.state.value.cliEngines.isEmpty())
+        assertNull(vm.state.value.ollamaSystemInfo, "Ollama is also lazy until a catalog or panel read")
 
         // And entering the section is what pays for it.
         vm.loadedEngines()

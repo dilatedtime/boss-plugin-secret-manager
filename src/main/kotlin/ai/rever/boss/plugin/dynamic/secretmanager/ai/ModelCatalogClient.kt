@@ -11,6 +11,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.longOrNull
 import java.net.URI
 import java.net.URLEncoder
 import java.net.http.HttpClient
@@ -18,6 +19,10 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.charset.StandardCharsets
 import java.time.Duration
+import java.time.OffsetDateTime
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 /**
  * Asks each provider what models the supplied credential can actually reach.
@@ -53,9 +58,12 @@ class ModelCatalogClient(
             )
 
         val first = fetchAllPages(descriptor, primary, apiKey)
-        if (first.isSuccess) return first
-
         val fallback = descriptor.modelsEndpointFallback ?: return first
+
+        // An explicit empty array is valid for an authoritative endpoint such as a fresh
+        // Ollama daemon. A provider with a fallback is different: its primary route is a
+        // best-effort guess, so an empty success is also a reason to ask the known fallback.
+        if (first.isSuccess && first.getOrThrow().isNotEmpty()) return first
 
         // xAI exposes a richer endpoint plus a minimal one; fall back rather than reporting
         // failure when only the richer route is unavailable.
@@ -65,8 +73,12 @@ class ModelCatalogClient(
         // retrying a 429 hits a provider that just asked us to slow down — twice per
         // refresh. An unrecognised envelope stays in scope because that is the other way a
         // wrong endpoint presents (a 200 that parses to nothing).
-        if (!worthRetryingOnFallback(first.exceptionOrNull())) return first
-        return fetchAllPages(descriptor, fallback, apiKey)
+        if (first.isFailure && !worthRetryingOnFallback(first.exceptionOrNull())) return first
+        val second = fetchAllPages(descriptor, fallback, apiKey)
+        // The primary still gave a valid explicit answer. A broken enrichment fallback must
+        // not turn "this provider currently has no models" into a discovery failure.
+        if (first.isSuccess && second.isFailure) return first
+        return second
     }
 
     /**
@@ -85,12 +97,16 @@ class ModelCatalogClient(
         val collected = mutableListOf<AiModel>()
         var cursor: String? = null
         var pages = 0
+        var explicitlyEmpty = false
+        var undecodedEntries = false
 
         while (pages < MAX_PAGES) {
             val page = requestPage(descriptor, endpoint, apiKey, cursor)
             val body = page.getOrElse { return Result.failure(it) }
 
             collected += body.models
+            explicitlyEmpty = explicitlyEmpty || body.explicitlyEmpty
+            undecodedEntries = undecodedEntries || (body.models.isEmpty() && !body.explicitlyEmpty)
             pages++
 
             // Assign before breaking: leaving the previous page's cursor in place made a
@@ -108,10 +124,9 @@ class ModelCatalogClient(
             )
         }
 
-        // A 2xx that parses to nothing means the envelope wasn't what we expected, not
-        // that the provider has no models. Reporting success here is what would put an
-        // empty dropdown under a "live · updated just now" label.
-        if (collected.isEmpty()) {
+        // An explicit empty model array is a valid answer (e.g. a fresh local daemon).
+        // An unknown shape or entries we cannot decode still must not masquerade as one.
+        if (collected.isEmpty() && (!explicitlyEmpty || undecodedEntries)) {
             return Result.failure(
                 UnrecognisedEnvelope(
                     "${descriptor.displayName} returned no recognisable models — response format not recognised.",
@@ -121,7 +136,7 @@ class ModelCatalogClient(
         return Result.success(collected.distinctBy { it.id }.sortedBy { it.displayName.lowercase() })
     }
 
-    private data class Page(val models: List<AiModel>, val nextCursor: String?)
+    private data class Page(val models: List<AiModel>, val nextCursor: String?, val explicitlyEmpty: Boolean)
 
     private suspend fun requestPage(
         descriptor: ProviderDescriptor,
@@ -271,7 +286,9 @@ class ModelCatalogClient(
         body: String,
     ): Page {
         val root = json.parseToJsonElement(body)
-        val entries = modelArray(root)
+        val entries = modelArray(root) ?: throw UnrecognisedEnvelope(
+            "${descriptor.displayName} model list response format was not recognised.",
+        )
         val cursor = nextCursor(descriptor, root)
 
         val models = entries
@@ -283,10 +300,12 @@ class ModelCatalogClient(
                     descriptor.id == ProviderRegistry.MOONSHOT -> moonshotModel(obj)
                     descriptor.id == ProviderRegistry.TOGETHER -> togetherModel(obj)
                     descriptor.id == ProviderRegistry.XAI -> xaiModel(obj)
+                    descriptor.id == ProviderRegistry.OPENROUTER -> openRouterModel(obj)
+                    isManagedProvider(descriptor.id) -> bossAiModel(obj)
                     else -> openAiModel(obj)
                 }
             }
-        return Page(models = models, nextCursor = cursor)
+        return Page(models = models, nextCursor = cursor, explicitlyEmpty = entries.isEmpty())
     }
 
     /**
@@ -331,12 +350,12 @@ class ModelCatalogClient(
      * xAI's and Together's envelope shape is not stated in their published model-list
      * references, so all three forms are accepted rather than betting on one.
      */
-    private fun modelArray(root: JsonElement): List<JsonElement> =
+    private fun modelArray(root: JsonElement): List<JsonElement>? =
         when {
             root is JsonArray -> root
             root is JsonObject && root["data"] is JsonArray -> (root["data"] as JsonArray)
             root is JsonObject && root["models"] is JsonArray -> (root["models"] as JsonArray)
-            else -> emptyList()
+            else -> null
         }
 
     private fun anthropicModel(obj: JsonObject): AiModel? {
@@ -365,6 +384,33 @@ class ModelCatalogClient(
     private fun openAiModel(obj: JsonObject): AiModel? {
         val id = obj.str("id") ?: return null
         return AiModel(id = id, displayName = id, ownedBy = obj.str("owned_by"))
+    }
+
+    private fun bossAiModel(obj: JsonObject): AiModel? {
+        val id = obj.str("id") ?: return null
+        val allowance = obj["allowance"] as? JsonObject
+        val summary = listOf("day", "week", "month").mapNotNull { period ->
+            val window = allowance?.get(period) as? JsonObject ?: return@mapNotNull null
+            val remaining = (window["remaining"] as? JsonPrimitive)?.longOrNull
+                ?.takeIf { it >= 0 } ?: return@mapNotNull null
+            val limit = (window["limit"] as? JsonPrimitive)?.longOrNull
+                ?.takeIf { it >= 0 } ?: return@mapNotNull null
+            val reset = window.str("resets_at") ?: return@mapNotNull null
+            val resetLabel = runCatching {
+                OffsetDateTime.parse(reset).withOffsetSameInstant(ZoneOffset.UTC)
+                    .format(DateTimeFormatter.ofPattern("dd MMM HH:mm 'UTC'", Locale.ENGLISH))
+            }.getOrNull() ?: return@mapNotNull null
+            "$period: $remaining / $limit tokens remaining (resets $resetLabel)"
+        }.joinToString("\n").takeIf { it.isNotEmpty() }
+        return AiModel(
+            id = id,
+            displayName = obj.str("name") ?: id,
+            contextLength = obj.int("context_length"),
+            maxOutputTokens = obj.int("max_output_tokens"),
+            capabilities = obj.strList("capabilities"),
+            isDefault = obj.bool("is_default") == true,
+            allowanceSummary = summary,
+        )
     }
 
     private fun moonshotModel(obj: JsonObject): AiModel? {
@@ -412,6 +458,20 @@ class ModelCatalogClient(
             displayName = id,
             capabilities = capabilities,
             ownedBy = obj.str("owned_by"),
+        )
+    }
+
+    /**
+     * OpenRouter documents `data[].context_length` directly on each model, unlike
+     * OpenAI's bare `id` — worth its own parser rather than the generic
+     * [openAiModel] so the picker can show a context length and a readable name.
+     */
+    private fun openRouterModel(obj: JsonObject): AiModel? {
+        val id = obj.str("id") ?: return null
+        return AiModel(
+            id = id,
+            displayName = obj.str("name") ?: id,
+            contextLength = obj.int("context_length"),
         )
     }
 

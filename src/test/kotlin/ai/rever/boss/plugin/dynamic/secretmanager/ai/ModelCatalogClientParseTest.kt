@@ -20,6 +20,32 @@ import kotlin.test.assertTrue
  * no error — so the shapes are locked down here rather than discovered in the app.
  */
 class ModelCatalogClientParseTest {
+    @Test
+    fun `shared catalog parses bigint allowances and rejects non-string capabilities`() = runTest {
+        val shared = SharedProviderDefinition(
+            "boss-managed-provider-v1", "Shared", "managed", "https://api.example/v1",
+        ).descriptor("entry")
+        val body = """{"data":[{"id":"published","name":"Published","is_default":true,
+            "context_length":2048,"max_output_tokens":100,"capabilities":["text","tools",true,42],
+            "allowance":{
+              "day":{"remaining":3000000000,"limit":4000000000,"resets_at":"2026-09-12T00:00:00Z"},
+              "week":{"remaining":"5000","limit":"6000","resets_at":"2026-09-14T00:00:00+00:00"},
+              "month":{"remaining":true,"limit":9000,"resets_at":"invalid"}
+            }}]}"""
+        val model = clientReturning(body).fetch(shared, "minted").getOrThrow().single()
+        assertEquals("published", model.id)
+        assertEquals("Published", model.displayName)
+        assertEquals(2048, model.contextLength)
+        assertEquals(100, model.maxOutputTokens)
+        assertTrue(model.isDefault)
+        assertEquals(listOf("text", "tools"), model.capabilities)
+        assertEquals(
+            "day: 3000000000 / 4000000000 tokens remaining (resets 12 Sep 00:00 UTC)\n" +
+                "week: 5000 / 6000 tokens remaining (resets 14 Sep 00:00 UTC)",
+            model.allowanceSummary,
+        )
+    }
+
     /** Returns [body] for every request, so only parsing is under test. */
     private fun clientReturning(
         body: String,
@@ -178,7 +204,76 @@ class ModelCatalogClientParseTest {
             assertNull(model.contextLength)
         }
 
+    // ==================== OpenRouter ====================
+
+    @Test
+    fun `openrouter reports its readable name and context length`() =
+        runTest {
+            val body = """
+                {"data":[{"id":"anthropic/claude-opus-5","name":"Anthropic: Claude Opus 5",
+                "context_length":200000,"pricing":{"prompt":"0.000015","completion":"0.000075"}}]}
+            """.trimIndent()
+
+            val model =
+                clientReturning(body).fetch(descriptor(ProviderRegistry.OPENROUTER), "k").getOrThrow().single()
+
+            assertEquals("anthropic/claude-opus-5", model.id)
+            assertEquals("Anthropic: Claude Opus 5", model.displayName)
+            assertEquals(200_000, model.contextLength)
+        }
+
+    // ==================== Ollama ====================
+
+    @Test
+    fun `ollama's openai-compatible list needs no special parser`() =
+        runTest {
+            // Ollama's /v1/models mirrors OpenAI's own envelope, so it falls through to
+            // openAiModel — this pins that assumption rather than the OpenAI test alone,
+            // since a future Ollama release changing that shape would not otherwise be
+            // caught here.
+            val body = """{"object":"list","data":[{"id":"llama3.2:latest","object":"model"}]}"""
+
+            val model =
+                clientReturning(body).fetch(descriptor(ProviderRegistry.OLLAMA), "").getOrThrow().single()
+
+            assertEquals("llama3.2:latest", model.id)
+        }
+
+    @Test
+    fun `a provider that requires no key is still fetched with a blank one`() =
+        runTest {
+            // ModelCatalog.refresh short-circuits to NotConfigured on a blank key for
+            // every ordinary provider (see ModelCatalogStateTest) — Ollama is the one
+            // exception, gated on ProviderDescriptor.requiresApiKey rather than on the
+            // key itself, and only an end-to-end ModelCatalog.refresh call exercises
+            // that branch; ModelCatalogClient.fetch alone never sees the short-circuit.
+            val body = """{"data":[{"id":"llama3.2:latest","object":"model"}]}"""
+            val catalog = ModelCatalog(client = clientReturning(body), cacheDir = null)
+
+            catalog.refresh(descriptor(ProviderRegistry.OLLAMA), apiKey = "", force = true)
+
+            val state = catalog.stateOf(ProviderRegistry.OLLAMA)
+            assertTrue(state is CatalogState.Loaded, "expected Loaded, was $state")
+            assertEquals(listOf("llama3.2:latest"), (state as CatalogState.Loaded).models.map { it.id })
+        }
+
     // ==================== failure shapes ====================
+
+    @Test
+    fun `an explicit empty catalog succeeds rather than being mistaken for an unknown envelope`() = runTest {
+        for (body in listOf("""{"data":[]}""", """{"models":[]}""", "[]")) {
+            val result = clientReturning(body).fetch(descriptor(ProviderRegistry.OPENAI), "k")
+            assertTrue(result.isSuccess, body)
+            assertTrue(result.getOrThrow().isEmpty(), body)
+        }
+    }
+
+    @Test
+    fun `unrecognisable entries do not masquerade as an explicitly empty catalog`() = runTest {
+        for (body in listOf("""{"data":[{"unexpected":"value"}]}""", """{"data":"not-an-array"}""")) {
+            assertTrue(clientReturning(body).fetch(descriptor(ProviderRegistry.OPENAI), "k").isFailure, body)
+        }
+    }
 
     @Test
     fun `an unrecognised envelope fails instead of reporting an empty list`() =

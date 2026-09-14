@@ -20,6 +20,17 @@ class ModelCatalogClientPagingTest {
     // ==================== Anthropic cursor ====================
 
     @Test
+    fun `an empty last page cannot hide undecodable entries on an earlier page`() = runTest {
+        val fake = QueuedHttpClient(listOf(
+            200 to """{"data":[{"unexpected":"value"}],"has_more":true,"last_id":"cursor"}""",
+            200 to """{"data":[],"has_more":false}""",
+        ))
+        val result = ModelCatalogClient(fake).fetch(descriptor(ProviderRegistry.ANTHROPIC), "k")
+        assertTrue(result.isFailure)
+        assertEquals(2, fake.requests.size)
+    }
+
+    @Test
     fun `follows has_more until the provider stops offering a cursor`() =
         runTest {
             val fake =
@@ -167,6 +178,41 @@ class ModelCatalogClientPagingTest {
                 ModelCatalogClient(fake).fetch(descriptor(ProviderRegistry.XAI), "k").getOrThrow()
 
             assertEquals(listOf("grok-5"), models.map { it.id })
+            assertEquals(2, fake.requests.size)
+        }
+
+    @Test
+    fun `xai falls back when the guessed primary endpoint explicitly reports no models`() =
+        runTest {
+            val fake =
+                QueuedHttpClient(
+                    listOf(
+                        200 to """{"data":[]}""",
+                        200 to """{"data":[{"id":"grok-fallback","owned_by":"xai"}]}""",
+                    ),
+                )
+
+            val models = ModelCatalogClient(fake).fetch(descriptor(ProviderRegistry.XAI), "k").getOrThrow()
+
+            assertEquals(listOf("grok-fallback"), models.map { it.id })
+            assertEquals(2, fake.requests.size)
+        }
+
+    @Test
+    fun `xai keeps an explicit empty primary result when its fallback fails`() =
+        runTest {
+            val fake =
+                QueuedHttpClient(
+                    listOf(
+                        200 to """{"data":[]}""",
+                        503 to """{"error":"fallback unavailable"}""",
+                    ),
+                )
+
+            val result = ModelCatalogClient(fake).fetch(descriptor(ProviderRegistry.XAI), "k")
+
+            assertTrue(result.isSuccess)
+            assertTrue(result.getOrThrow().isEmpty())
             assertEquals(2, fake.requests.size)
         }
 

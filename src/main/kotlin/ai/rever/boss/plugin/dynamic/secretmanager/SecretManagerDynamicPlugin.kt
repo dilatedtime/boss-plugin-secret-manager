@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.secretmanager
 
+import ai.rever.boss.plugin.api.CustomPluginEvent
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.SecretDataProvider
@@ -16,7 +17,9 @@ import ai.rever.boss.plugin.dynamic.secretmanager.ai.ProviderCredentialStore
 import ai.rever.boss.plugin.logging.BossLogger
 import ai.rever.boss.plugin.logging.LogCategory
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.io.File
 
 /**
@@ -36,8 +39,8 @@ class SecretManagerDynamicPlugin : DynamicPlugin {
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-secret-manager"
 
     private companion object {
-        /** api release that introduced LlmProviderSettingsAPI. */
-        const val REQUIRED_API_VERSION = "1.0.71"
+        /** Minimum api release required by this implementation's model-discovery signature. */
+        const val REQUIRED_API_VERSION = "1.0.89"
 
         /**
          * Deliberately on the companion, not an instance property.
@@ -81,12 +84,29 @@ class SecretManagerDynamicPlugin : DynamicPlugin {
             return
         }
 
+        val navigation = ProviderNavigation()
+        // Verified against the v1.0.73 tag (which predates the current 1.0.89 floor): PluginContext's
+        // applicationEventBus, eventsOfType(Class<T>), and CustomPluginEvent's
+        // eventName/payload all exist there, so this path needs no linkage adapter.
+        context.applicationEventBus?.let { bus ->
+            // Subscribe before register returns so a racing management action is retained;
+            // collection suspends immediately and performs no credential or catalog I/O.
+            pluginScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                navigation.collect({ bus.eventsOfType(CustomPluginEvent::class.java) }) { failure ->
+                    logger.warn(
+                        LogCategory.SYSTEM,
+                        "AI provider navigation stopped (${failure.javaClass.simpleName}); secret management remains available",
+                    )
+                }
+            }
+        }
+
         // Built once and shared: the panel's "Add AI Provider Key" action and the
         // settings panel must write through the same store, or an entry added from one
         // wouldn't be recognised as provider configuration by the other.
         //
         // Safe to construct outside the LinkageError guard below — ProviderCredentialStore
-        // and ProviderRegistry reference only api symbols that predate 1.0.71.
+        // and ProviderRegistry reference only api symbols covered by the 1.0.89 floor.
         val envResolver = EnvResolver()
         val credentialStore = ProviderCredentialStore(secretDataProvider, envResolver)
 
@@ -114,13 +134,15 @@ class SecretManagerDynamicPlugin : DynamicPlugin {
                 windowId = context.windowId,
                 splitViewOperations = context.splitViewOperations,
                 authDataProvider = context.authDataProvider,
-                aiProvidersViewModel = { aiProvidersViewModel }
+                aiProvidersViewModel = { aiProvidersViewModel },
+                providerNavigation = navigation.state,
+                consumeProviderRequest = navigation::consume,
             )
         }
 
         // Contribute secret_* MCP tools (expose secret values to agents; auto-removed on disable/unload).
         context.registerMcpToolProvider(
-            SecretManagerMcpToolProvider(pluginId, secretDataProvider, credentialStore),
+            SecretManagerMcpToolProvider(pluginId, secretDataProvider, supabaseDataProvider, credentialStore),
         )
 
         aiProvidersViewModel =
@@ -132,11 +154,9 @@ class SecretManagerDynamicPlugin : DynamicPlugin {
      * to the host's Settings → AI Providers section and to other plugins via
      * PluginContext.llmProvider.
      *
-     * Guarded: LlmProviderSettingsAPI is a shared-package (parent-first) class added in
-     * api 1.0.71, so on hosts that predate it LlmProviderSettingsApiImpl fails to link.
-     * Skipping registration there costs only the AI panel — secret management, MCP
-     * tools and everything else still work. This is why the plugin's declared
-     * apiVersion stays at its true floor instead of being raised to 1.0.71.
+     * Guarded as a final containment boundary for linkage failures. The declared api floor is
+     * still authoritative: it is 1.0.89 because [LlmProviderSettingsApiImpl.availableModels]
+     * exposes types introduced there, including in a lazily resolved method signature.
      */
     private fun registerAiProviderSettings(
         context: PluginContext,
@@ -153,9 +173,8 @@ class SecretManagerDynamicPlugin : DynamicPlugin {
                     ?.getPluginCacheDirectory(pluginId)
                     ?.let { File(it) }
 
-            // Inside the guard on purpose: the bridge names an api type added in
-            // 1.0.74, so resolving it is exactly what must not happen on an older
-            // host. Left unset when the host has no broker relay, which makes
+            // Inside the guard on purpose: a malformed host can still violate the declared
+            // 1.0.89 floor. Left unset when the host has no broker relay, which makes
             // brokered providers report unconfigured instead of failing.
             credentialStore.brokeredKeys = BrokeredCredentialBridge.from(context)
 
@@ -168,13 +187,11 @@ class SecretManagerDynamicPlugin : DynamicPlugin {
                     envResolver = envResolver,
                     splitViewOperations = context.splitViewOperations,
                     scope = pluginScope,
-                    // Inside the guard for the same reason the broker bridge above is: the
-                    // adapter names api types added in 1.0.78, so resolving it is exactly what
-                    // must not happen on an older host. Null there, which costs the Local CLI
-                    // section and nothing else.
+                    // The adapter names host types only at this boundary and resolves the
+                    // optional gateway per call. Null costs the Local CLI section and nothing else.
                     cliEngines = GatewayCliEngineAccess.orNull(context),
                     // Not guarded by anything: every symbol it touches (PluginLoaderDelegate,
-                    // PanelEventProvider, PanelId, openPanel) predates this plugin's 1.0.73 floor.
+                    // PanelEventProvider, PanelId, openPanel) predates this plugin's 1.0.89 floor.
                     // It lives inside the guard only because the ViewModel that holds it does.
                     gateway = GatewayPresence.from(context),
                 )
@@ -187,12 +204,11 @@ class SecretManagerDynamicPlugin : DynamicPlugin {
             viewModel.ensureConnectionsLoaded()
             return viewModel
         } catch (_: LinkageError) {
-            // Host predates LlmProviderSettingsAPI — skip; everything else works.
-            // Logged rather than swallowed: without this, "the AI Providers section is
-            // missing" has no explanation anywhere.
+            // A malformed or unexpectedly old host api reached registration despite the
+            // manifest floor. Logged rather than swallowed so a missing AI section is visible.
             logger.info(
                 LogCategory.SYSTEM,
-                "AI provider settings not served — host api predates LlmProviderSettingsAPI",
+                "AI provider settings not served — host API linkage failed",
                 mapOf("requiredApiVersion" to REQUIRED_API_VERSION),
             )
             return null

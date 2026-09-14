@@ -11,12 +11,14 @@ import ai.rever.boss.plugin.api.SupabaseDataProvider
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.AiProvidersViewModel
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.ProviderCredentialStore
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.arkivanov.decompose.ComponentContext
 import com.arkivanov.essenty.lifecycle.doOnDestroy
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.StateFlow
 
 /**
  * Secret Manager panel component (Dynamic Plugin)
@@ -49,7 +51,9 @@ class SecretManagerComponent(
      * window through `LlmProviderSettingsApiImpl`. Disposing it in `doOnDestroy` would take the
      * host's AI Providers section down with the sidebar panel.
      */
-    private val aiProvidersViewModel: () -> AiProvidersViewModel? = { null }
+    private val aiProvidersViewModel: () -> AiProvidersViewModel? = { null },
+    private val providerNavigation: StateFlow<Map<String, Long>>? = null,
+    private val consumeProviderRequest: (String?, Long, Boolean) -> Boolean = { _, _, _ -> false },
 ) : PanelComponentWithUI, ComponentContext by ctx {
 
     // Created once per panel instance (not per composition), so secrets stay
@@ -103,6 +107,14 @@ class SecretManagerComponent(
 
     @Composable
     override fun Content() {
+        LaunchedEffect(providerNavigation, windowId) {
+            providerNavigation?.collect { requests ->
+                val request = requests[windowId] ?: return@collect
+                if (consumeProviderRequest(windowId, request, aiProvidersViewModel() != null)) {
+                    selectedSection = SecretPanelSection.AI_PROVIDERS
+                }
+            }
+        }
         SecretManagerContent(
             viewModel = viewModel,
             sharedSecretsViewModel = sharedSecretsViewModel,

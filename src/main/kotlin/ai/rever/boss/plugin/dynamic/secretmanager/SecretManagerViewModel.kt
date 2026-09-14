@@ -4,6 +4,9 @@ import ai.rever.boss.plugin.api.*
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.CredentialSource
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.ProviderCredentialStore
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.ProviderRegistry
+import ai.rever.boss.plugin.dynamic.secretmanager.ai.SharedProviderDefinition
+import ai.rever.boss.plugin.dynamic.secretmanager.ai.bossAiDefinitionRequest
+import ai.rever.boss.plugin.dynamic.secretmanager.ai.managedProviderUpdate
 import ai.rever.boss.plugin.logging.BossLogger
 import ai.rever.boss.plugin.logging.LogCategory
 import androidx.compose.runtime.getValue
@@ -414,7 +417,9 @@ class SecretManagerViewModel(
 
             // Pre-select the first provider that has no key yet, since adding is the
             // common case; changing an existing one is then an explicit pick.
-            val firstUnset = ProviderRegistry.all
+            // Over the same list the dialog offers, or this pre-selects a provider the user
+            // cannot then see in the picker.
+            val firstUnset = ProviderRegistry.userKeyed
                 .firstOrNull { (sources[it.id] ?: CredentialSource.NONE) == CredentialSource.NONE }
                 ?.id
 
@@ -485,6 +490,57 @@ class SecretManagerViewModel(
                         errorMessage = error.message ?: "Could not save the provider key."
                     )
                 }
+        }
+    }
+
+    /**
+     * Create the canonical BOSS AI definition, or upgrade the matching inert entry
+     * someone already entered by hand. Sharing remains an explicit second action on
+     * the resulting card so the existing permission-checked share dialog owns targets.
+     */
+    fun prepareBossAiProviderDefinition() {
+        val provider = secretDataProvider ?: return
+        state = state.copy(isOperationInProgress = true, errorMessage = null)
+        scope.launch {
+            val candidates = provider.searchSecrets(SharedProviderDefinition.BOSS_AI_WEBSITE, limit = 50)
+                .getOrElse { error ->
+                    state = state.copy(
+                        isOperationInProgress = false,
+                        errorMessage = error.message ?: "Could not look for an existing BOSS AI definition.",
+                    )
+                    return@launch
+                }
+                .data
+                .filter {
+                    it.website == SharedProviderDefinition.BOSS_AI_WEBSITE &&
+                        it.username == SharedProviderDefinition.BOSS_AI_USERNAME
+                }
+
+            if (candidates.size > 1) {
+                state = state.copy(
+                    isOperationInProgress = false,
+                    errorMessage = "More than one BOSS AI definition exists. Remove duplicates before publishing.",
+                )
+                return@launch
+            }
+
+            val write = candidates.singleOrNull()?.let { existing ->
+                managedProviderUpdate(existing).fold(
+                    onSuccess = { provider.updateSecret(it) },
+                    onFailure = { Result.failure(it) },
+                )
+            } ?: provider.createSecret(bossAiDefinitionRequest())
+
+            write.onSuccess {
+                aiProviderStore?.invalidate()
+                state = state.copy(isOperationInProgress = false, errorMessage = null)
+                loadSecrets()
+            }.onFailure { error ->
+                state = state.copy(
+                    isOperationInProgress = false,
+                    errorMessage = error.message ?: "Could not prepare the BOSS AI definition.",
+                )
+            }
         }
     }
 
