@@ -9,6 +9,14 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption.ATOMIC_MOVE
+import java.nio.file.StandardCopyOption.REPLACE_EXISTING
+import java.nio.file.StandardOpenOption.TRUNCATE_EXISTING
+import java.nio.file.StandardOpenOption.WRITE
 
 /**
  * Remembers which provider is the active one — what `LlmProvider.activeConfig()`
@@ -24,7 +32,6 @@ class ActiveProviderPrefs(
 ) {
     private val logger = BossLogger.forComponent("AiProviderPrefs")
     private val json = Json { ignoreUnknownKeys = true }
-    private val mutex = Mutex()
 
     private val file: File get() = File(bossRootDir, FILE_NAME)
 
@@ -89,19 +96,23 @@ class ActiveProviderPrefs(
     }
 
     private suspend fun readPrefs(): Prefs =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                if (!file.exists()) return@runCatching null
-                json.decodeFromString(Prefs.serializer(), file.readText())
-            }.getOrNull() ?: Prefs()
+        preferenceMutex.withLock {
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    if (!file.exists()) return@runCatching null
+                    json.decodeFromString(Prefs.serializer(), file.readText())
+                }.getOrNull() ?: Prefs()
+            }
         }
 
     /**
-     * Read-modify-write under [mutex]: the active provider and the model map live in one
-     * file, so concurrent writers would otherwise drop each other's field.
+     * Read-modify-write under the process-wide [preferenceMutex]: separate UI and
+     * discovery objects share this file, so an instance-owned lock still loses updates.
+     * Reads take the same lock because Windows denies replacement while another accessor
+     * has the target open.
      */
     private suspend fun update(transform: (Prefs) -> Prefs) {
-        mutex.withLock {
+        preferenceMutex.withLock {
             withContext(Dispatchers.IO) {
                 runCatching {
                     val current =
@@ -111,16 +122,9 @@ class ActiveProviderPrefs(
                         } else {
                             Prefs()
                         }
-                    file.parentFile?.mkdirs()
-                    // Temp-then-rename, as with the model cache: writeText truncates in
-                    // place, so an interrupted write loses both the active provider and
-                    // every model selection at once.
-                    val temp = File(file.parentFile, "${file.name}.tmp")
-                    temp.writeText(json.encodeToString(Prefs.serializer(), transform(current)))
-                    if (!temp.renameTo(file)) {
-                        temp.copyTo(file, overwrite = true)
-                        temp.delete()
-                    }
+                    replaceAtomically(
+                        json.encodeToString(Prefs.serializer(), transform(current)),
+                    )
                 }.onFailure {
                     logger.warn(
                         LogCategory.SYSTEM,
@@ -133,6 +137,33 @@ class ActiveProviderPrefs(
         }
     }
 
+    /**
+     * Flush a complete record before replacing the live file. A unique sibling avoids
+     * fixed-temp collisions, while the non-atomic fallback covers file systems that do
+     * not implement [ATOMIC_MOVE] without returning to truncate-in-place writes.
+     */
+    private fun replaceAtomically(contents: String) {
+        val target = file.toPath()
+        val parent = target.parent ?: error("Preference file has no parent")
+        Files.createDirectories(parent)
+        val temp = Files.createTempFile(parent, ".$FILE_NAME-", ".tmp")
+
+        try {
+            FileChannel.open(temp, WRITE, TRUNCATE_EXISTING).use { channel ->
+                val bytes = ByteBuffer.wrap(contents.toByteArray(Charsets.UTF_8))
+                while (bytes.hasRemaining()) channel.write(bytes)
+                channel.force(true)
+            }
+            try {
+                Files.move(temp, target, ATOMIC_MOVE, REPLACE_EXISTING)
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(temp, target, REPLACE_EXISTING)
+            }
+        } finally {
+            Files.deleteIfExists(temp)
+        }
+    }
+
     @Serializable
     private data class Prefs(
         val activeProviderId: String? = null,
@@ -142,5 +173,9 @@ class ActiveProviderPrefs(
 
     companion object {
         private const val FILE_NAME = "ai_provider_prefs.json"
+
+        // There is one preference record per BOSS process. Keep its transaction lock at
+        // the same lifetime so independently constructed accessors cannot race.
+        private val preferenceMutex = Mutex()
     }
 }
