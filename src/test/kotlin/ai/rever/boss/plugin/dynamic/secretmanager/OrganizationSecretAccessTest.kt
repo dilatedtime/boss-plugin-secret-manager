@@ -266,6 +266,56 @@ class OrganizationSecretAccessTest {
         assertEquals(ShareTargetPresentation("Unknown target", "Unknown", false), unknown)
     }
 
+    @Test
+    fun `refresh during pagination clears the cancelled page spinner and permits more pages`() = runTest {
+        val provider = RecordingProvider((1..51).map { access(secret("s$it"), canManage = true) })
+        val vm = viewModel(this, provider)
+        advanceUntilIdle()
+        provider.pageGate = CompletableDeferred()
+        vm.loadMoreSecrets()
+        advanceUntilIdle()
+        assertTrue(vm.state.isLoadingMore)
+
+        vm.loadSecrets()
+        advanceUntilIdle()
+        assertFalse(vm.state.isLoadingMore)
+        assertEquals(50, vm.state.secrets.size)
+
+        provider.pageGate?.complete(Unit)
+        vm.loadMoreSecrets()
+        advanceUntilIdle()
+        assertEquals(51, vm.state.secrets.size)
+        assertFalse(vm.state.isLoadingMore)
+    }
+
+    @Test
+    fun `old share mutation cannot invalidate the newly opened secret share request`() = runTest {
+        val first = secret("s1")
+        val second = secret("s2")
+        val provider = RecordingProvider(listOf(access(first, true), access(second, true)))
+        val vm = viewModel(this, provider)
+        advanceUntilIdle()
+        vm.showShareDialog(first)
+        advanceUntilIdle()
+        provider.mutationGate = CompletableDeferred()
+        vm.shareSecret(ShareSecretRequestData(first.id, targetUserId = "u1"))
+        advanceUntilIdle()
+        vm.hideShareDialog()
+
+        provider.shareRows = listOf(SecretShareWithTargetData(share("second-share"), "org-2", "second-org"))
+        provider.shareGate = CompletableDeferred()
+        vm.showShareDialog(second)
+        advanceUntilIdle()
+        provider.mutationGate?.complete(Unit)
+        advanceUntilIdle()
+        provider.shareGate?.complete(Unit)
+        advanceUntilIdle()
+
+        assertEquals(second.id, vm.state.selectedSecret?.id)
+        assertEquals("second-share", vm.state.secretShares.single().shareId)
+        assertFalse(vm.state.isLoadingShares)
+    }
+
     private fun viewModel(
         scope: kotlinx.coroutines.CoroutineScope,
         provider: SecretDataProvider,
@@ -282,6 +332,8 @@ class OrganizationSecretAccessTest {
         var searchRows: List<SecretEntryWithAccessData> = rows
         var shareRows: List<SecretShareWithTargetData> = emptyList()
         var shareGate: CompletableDeferred<Unit>? = null
+        var pageGate: CompletableDeferred<Unit>? = null
+        var mutationGate: CompletableDeferred<Unit>? = null
         var failReads: Boolean = false
         val updates = mutableListOf<UpdateSecretRequestData>()
         val deletes = mutableListOf<String>()
@@ -291,7 +343,10 @@ class OrganizationSecretAccessTest {
         override suspend fun getUserSecrets(limit: Int, offset: Int): Result<PaginatedSecretsData> =
             page(rows, limit, offset).map { page -> PaginatedSecretsData(page.data.map { it.secret }, page.hasMore) }
 
-        override suspend fun getUserSecretsWithAccess(limit: Int, offset: Int) = page(rows, limit, offset)
+        override suspend fun getUserSecretsWithAccess(limit: Int, offset: Int): Result<PaginatedSecretsWithAccessData> {
+            if (offset > 0) pageGate?.await()
+            return page(rows, limit, offset)
+        }
 
         override suspend fun searchSecrets(query: String, limit: Int, offset: Int): Result<PaginatedSecretsData> =
             page(searchRows, limit, offset).map { page -> PaginatedSecretsData(page.data.map { it.secret }, page.hasMore) }
@@ -320,6 +375,7 @@ class OrganizationSecretAccessTest {
 
         override suspend fun shareSecret(request: ShareSecretRequestData): Result<Unit> {
             sharesSent += request
+            mutationGate?.await()
             return Result.success(Unit)
         }
 

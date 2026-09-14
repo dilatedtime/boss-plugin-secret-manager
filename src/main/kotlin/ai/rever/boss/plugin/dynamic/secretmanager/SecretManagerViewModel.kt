@@ -231,6 +231,8 @@ class SecretManagerViewModel(
         searchJob = null
         state = state.copy(
             isLoading = true,
+            // Refresh replaces a paginated load, including its progress state.
+            isLoadingMore = false,
             errorMessage = null,
             searchQuery = "",
             currentOffset = 0,
@@ -841,6 +843,11 @@ class SecretManagerViewModel(
     }
 
     fun loadSecretShares(secretId: String) {
+        // A mutation can finish after its dialog closed or another secret was opened.
+        // It must not invalidate that dialog's request or leave an orphaned spinner.
+        if (disposed || !state.showShareDialog || state.selectedSecret?.id != secretId ||
+            !canManageSecret(secretId)
+        ) return
         val generation = ++shareRequestGeneration
         state = state.copy(isLoadingShares = true)
 
