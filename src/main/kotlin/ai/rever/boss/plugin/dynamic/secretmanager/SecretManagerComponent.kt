@@ -5,7 +5,6 @@ import ai.rever.boss.plugin.api.PanelComponentWithUI
 import ai.rever.boss.plugin.api.PanelInfo
 import ai.rever.boss.plugin.api.PluginStoreApiKeyProvider
 import ai.rever.boss.plugin.api.SecretDataProvider
-import ai.rever.boss.plugin.api.SettingsProvider
 import ai.rever.boss.plugin.api.SplitViewOperations
 import ai.rever.boss.plugin.api.SupabaseDataProvider
 import ai.rever.boss.plugin.dynamic.secretmanager.ai.AiProvidersViewModel
@@ -34,7 +33,6 @@ class SecretManagerComponent(
     private val pluginStoreApiKeyProvider: PluginStoreApiKeyProvider?,
     private val scope: CoroutineScope,
     private val aiProviderStore: ProviderCredentialStore? = null,
-    private val settingsProvider: SettingsProvider? = null,
     private val windowId: String? = null,
     private val splitViewOperations: SplitViewOperations? = null,
     private val authDataProvider: AuthDataProvider? = null,

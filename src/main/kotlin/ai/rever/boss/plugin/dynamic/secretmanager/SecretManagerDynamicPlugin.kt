@@ -130,7 +130,6 @@ class SecretManagerDynamicPlugin : DynamicPlugin {
                 pluginStoreApiKeyProvider = pluginStoreApiKeyProvider,
                 scope = pluginScope,
                 aiProviderStore = credentialStore,
-                settingsProvider = context.settingsProvider,
                 windowId = context.windowId,
                 splitViewOperations = context.splitViewOperations,
                 authDataProvider = context.authDataProvider,

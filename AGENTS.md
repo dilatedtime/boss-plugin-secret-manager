@@ -272,9 +272,8 @@ the shared tab; both are reverted, and `git diff` on those two lines is empty.
 
 ## Three sections, and the AI one is not owned by the panel
 
-The panel is segmented into **Secrets**, **Shared with me** and **AI** - the last being the same
-`AiProvidersPanel` the host renders at Settings, AI Providers, from one definition rather than a
-second copy. It is there because this plugin owns every AI credential in BOSS while the panel
+The panel is segmented into **Secrets**, **Shared with me** and **AI**. `AiProvidersPanel` also
+remains available through the compatibility settings API for older hosts, from one definition. It is there because this plugin owns every AI credential in BOSS while the panel
 holding them was reachable only through the host's Settings window: two clicks and a different
 window away from the vault the keys are stored in.
 
@@ -300,9 +299,8 @@ after `register()` returns. Do not "simplify" it to a value.
 
 **The panel does not own it and must not dispose it.** Every other ViewModel on
 `SecretManagerComponent` is per panel instance and cancelled in `lifecycle.doOnDestroy`; this one is
-the plugin's single instance, shared with the host's Settings window through
-`LlmProviderSettingsApiImpl`. Disposing it with the sidebar panel would take the host's AI Providers
-section down too.
+the plugin's single instance, serving consumer APIs and compatibility settings through
+`LlmProviderSettingsApiImpl`. Disposing it with the sidebar panel would break those consumers too.
 
 **The tab is absent, not disabled, when there is no ViewModel.** Registration still contains an
 unexpected `LinkageError` so the secrets panel survives a malformed host API, and a tab whose only
@@ -406,14 +404,14 @@ a separate titled section below the whole eight-row list, which was fine in the 
 window where it was all on screen at once - and wrong in a sidebar one row wide, where tapping the
 fourth provider put the response off the bottom of the panel and the tap read as doing nothing.
 
-Expanding in place also retired the detail's own `BossSection(title = descriptor.displayName)`: the
-row directly above it is that name, and repeating it was the loudest thing in the expanded state.
+Expanding in place removes the duplicate detail title for listed providers. New-provider forms
+retain their title. Clicking an open row closes it and clears its draft, and a placed editor
+requests scrolling into view so a secret-card link can reveal a provider below the fold.
 
 Section descriptions are one short line. `BossSection`'s description is set for the width of the
 Settings window; at sidebar width, two sentences of guidance is three lines of text above content
 that explains itself. Keep the fact a first-time reader cannot infer (a CLI login overrides the
 providers below) and drop the instructions.
-
 
 ### Automatic BOSS AI discovery
 
@@ -575,10 +573,9 @@ The deployment/definition schema is documented in the host repository at
 `supabase/functions/boss-ai/README.md`. A host release must register the trusted
 broker for legacy shares; automatic BOSS AI uses the plugin-owned ticket flow instead.
 
-This plugin owns **all** AI provider configuration. The host has none: its
-`Settings → AI Providers` section renders `LlmProviderSettingsPanel` through
-`LlmProviderSettingsAPI`, and `PluginContext.llmProvider` is relayed from the same
-registered instance. Provider registry, credentials, environment-variable resolution
+This plugin owns **all** AI provider configuration. Older hosts can render
+`LlmProviderSettingsPanel` through `LlmProviderSettingsAPI`; current hosts use this panel.
+`PluginContext.llmProvider` is relayed from the same registered instance. Provider registry, credentials, environment-variable resolution
 and the model catalogue all live here.
 
 ### Consumer discovery is connection-first and credential-free
@@ -1187,11 +1184,13 @@ will drift; that file is the only place to change them.
 
 `isEditorOpen` is separate from `selectedProviderId`, and only one of them survives a reload.
 Remembering which provider you were looking at is useful; reopening a transient form nobody asked
-for this time is not — so `load()` sets `isEditorOpen = false` and leaves `selectedProviderId`
-alone.
+for this time is not — so `enterSection()` closes the old editor and keeps the selection. A validated, one-shot
+`requestProviderOnEntry()` command is the exception: it opens that provider on the next entry.
+The shared panel owns this path, including environment refresh, legacy import and a local Ollama
+probe before vault loading; the compatibility host wrapper must not start a second load.
 
 This matters because the ViewModel is the plugin's **single instance**, shared between the sidebar
-AI tab and the host's `Settings → AI Providers` (see "Three sections, and the AI one is not owned
+AI tab, consumer APIs and older hosts' compatibility settings (see "Three sections, and the AI one is not owned
 by the panel"). A per-panel ViewModel would reset the flag for free by being reconstructed; this
 one carries whatever the last visit left, to both surfaces. `ProviderRow`'s
 `isSelected = state.isEditorOpen && …` guard depends on the reset too — without it the stale
@@ -1215,7 +1214,7 @@ rather than failing.
 
 ### Tests
 
-`./gradlew test` - 302 host-independent cases, no live credential needed, run on every
+`./gradlew test` - host-independent cases, no live credential needed, run on every
 pull request by `.github/workflows/test.yml`. The
 model-list parsers are the point: each was written from a provider's published
 reference, and xAI's and Together's envelopes aren't documented at all, so
@@ -1233,8 +1232,8 @@ past the first page, and the cache honouring `invalidate()`. `ModelCatalogClient
 uses a response *queue* rather than one fixed body, which is what makes cursor-following, the
 `MAX_PAGES` bound and the xAI primary-then-fallback path reachable at all.
 
-**Every `AiProvidersViewModel` a test builds must be handed `noOllamaOnThisMachine()`.** `init`
-calls `refreshOllamaSystemInfo()`, so the default `OllamaSystemCheck()` reads the real `PATH`, the
+**Every `AiProvidersViewModel` a test builds must be handed `noOllamaOnThisMachine()`.** Panel entry and
+consumer catalog discovery probe the machine, so the default `OllamaSystemCheck()` reads the real `PATH`, the
 real `user.home` and the real JMX bean - which quietly falsifies `envIn`'s "every source of
 variables is injected" and makes the result depend on whether the machine running the suite
 happens to have Ollama installed. `OllamaSystemCheckTest` has the same rule for

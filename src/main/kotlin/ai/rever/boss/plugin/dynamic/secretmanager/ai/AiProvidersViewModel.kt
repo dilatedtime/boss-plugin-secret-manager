@@ -201,6 +201,19 @@ class AiProvidersViewModel(
 
     /** Guards [ensureSectionLoaded] so entering the section twice does not re-probe. */
     private val sectionLoadStarted = AtomicBoolean(false)
+    private val providerOnNextEntry = AtomicReference<String?>(null)
+
+    /** A one-shot navigation command, distinct from the editor left open on a prior visit. */
+    fun requestProviderOnEntry(providerId: String): Boolean {
+        if (descriptorOf(providerId) == null) return false
+        providerOnNextEntry.set(providerId)
+        return true
+    }
+
+    fun enterSection(): Job {
+        ensureSectionLoaded()
+        return load(providerOnNextEntry.getAndSet(null))
+    }
 
     /** Guards [ensureConnectionsLoaded] so concurrent callers load credentials once. */
     private val connectionsLoadStarted = AtomicBoolean(false)
@@ -508,7 +521,7 @@ class AiProvidersViewModel(
     }
 
     /** Load credentials, seed cached model lists, then refresh anything stale. */
-    fun load(): Job {
+    fun load(providerToOpen: String? = null): Job {
         connectionsLoadStarted.set(true)
         catalogsLoadStarted.set(true)
         val catalogRequestedAtNanos = monotonicNanos()
@@ -517,13 +530,24 @@ class AiProvidersViewModel(
         // is the panel's own "this entry is still settling" signal, and a caller that returns
         // from load() to a state still reading `isLoading = false` is being told the load
         // already finished. Nothing about the flag needs the coroutine.
-        _state.update { it.copy(isLoading = true, error = null) }
+        _state.update {
+            it.copy(
+                isLoading = true,
+                error = null,
+                isEditorOpen = providerToOpen != null,
+                selectedProviderId = providerToOpen ?: it.selectedProviderId,
+                keyDrafts = emptyMap(),
+            )
+        }
         return scope.launch {
             // Re-read the environment on every entry into the section. The panel tells
             // users they can unset a variable to take key management over in BOSS, and the
             // resolver memoises misses as well as hits — so without this that instruction
             // was only true after an app restart.
             envResolver.invalidate()
+            // Local setup and legacy migration must not depend on vault readiness.
+            readOllamaSystemInfo()
+            checkLegacyImport()
             val connections = loadConnections() ?: run {
                 _state.update { it.copy(isLoading = false) }
                 return@launch
@@ -532,15 +556,9 @@ class AiProvidersViewModel(
             _state.update { current ->
                 current.copy(
                     isLoading = false,
-                    // Closed on every entry into the section. This ViewModel is the plugin's
-                    // single instance, shared between the sidebar AI tab and the host's
-                    // Settings -> AI Providers, so without this an editor left open on one
-                    // visit rides through to the next one - and to the other surface - which
-                    // is the always-open form this redesign set out to remove. Deliberately
-                    // *not* symmetrical with selectedProviderId below: remembering which
-                    // provider you were looking at is useful, reopening a transient form
-                    // nobody asked for this time is not.
-                    isEditorOpen = false,
+                    // An entry command may have disappeared during discovery. Never
+                    // render the fallback provider's editor for that stale id.
+                    isEditorOpen = current.isEditorOpen && descriptorOf(current.selectedProviderId) != null,
                     // Keep whichever provider the user had expanded. This runs from a
                     // LaunchedEffect on every entry into the section, so resetting the
                     // selection here discarded their place each time.
@@ -565,9 +583,8 @@ class AiProvidersViewModel(
                 connections,
                 catalogRequestedAtNanos,
                 catalogGeneration,
-                refreshOllamaProbe = true,
+                refreshOllamaProbe = false,
             )
-            checkLegacyImport()
         }
     }
 
@@ -639,6 +656,10 @@ class AiProvidersViewModel(
      * keyless provider stick; for one that already has a row it is a no-op.
      */
     fun selectProvider(providerId: String) {
+        if (descriptorOf(providerId) == null) {
+            _state.update { it.copy(isEditorOpen = false, error = "This AI provider is no longer available.") }
+            return
+        }
         _state.update {
             it.copy(
                 selectedProviderId = providerId,
@@ -648,6 +669,11 @@ class AiProvidersViewModel(
                 error = null,
             )
         }
+    }
+
+    fun toggleProvider(providerId: String) {
+        if (state.value.isEditorOpen && state.value.selectedProviderId == providerId) closeEditor()
+        else selectProvider(providerId)
     }
 
     /**

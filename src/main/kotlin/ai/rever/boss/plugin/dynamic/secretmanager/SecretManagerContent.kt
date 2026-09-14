@@ -396,9 +396,10 @@ private fun SecretManagerView(
                         listState = listState,
                         clipboardManager = clipboardManager,
                         onOpenAiProvider = { providerId ->
-                            aiViewModel?.let { model ->
-                                model.selectProvider(providerId)
+                            if (aiViewModel?.requestProviderOnEntry(providerId) == true) {
                                 onSelectSection(SecretPanelSection.AI_PROVIDERS)
+                            } else {
+                                viewModel.reportAiProviderUnavailable()
                             }
                         },
                         modifier = Modifier.weight(1f),

@@ -21,6 +21,9 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -34,6 +37,7 @@ import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -63,12 +67,9 @@ fun AiProvidersPanel(
     viewModel: AiProvidersViewModel,
     modifier: Modifier = Modifier,
 ) {
-    androidx.compose.runtime.LaunchedEffect(viewModel) {
-        viewModel.ensureSectionLoaded()
-        viewModel.ensureCatalogsLoaded()
-    }
+    LaunchedEffect(viewModel) { viewModel.enterSection() }
     val state by viewModel.state.collectAsState()
-    val selected = state.providers.firstOrNull { it.id == state.selectedProviderId } ?: ProviderRegistry.default
+    val selected = state.providers.firstOrNull { it.id == state.selectedProviderId }
 
     // Scrolls itself: the host registers this as an embedded panel and does not wrap it
     // in a scroll container (nesting two would measure with infinite height and crash).
@@ -191,9 +192,9 @@ fun AiProvidersPanel(
                             // a row as open when the card below it is closed.
                             isSelected = state.isEditorOpen && descriptor.id == state.selectedProviderId,
                             isActive = descriptor.id == state.activeProviderId,
-                            onClick = { viewModel.selectProvider(descriptor.id) },
+                            onClick = { viewModel.toggleProvider(descriptor.id) },
                         )
-                        if (state.isEditorOpen && descriptor.id == selected.id) {
+                        if (state.isEditorOpen && descriptor.id == state.selectedProviderId) {
                             ProviderDetail(
                                 descriptor = descriptor,
                                 state = state,
@@ -226,7 +227,7 @@ fun AiProvidersPanel(
                     onPick = viewModel::selectProvider,
                     onPickCustom = { viewModel.selectProvider(ProviderRegistry.CUSTOM) },
                 )
-                if (state.isEditorOpen && selected.id !in listedIds) {
+                if (state.isEditorOpen && selected != null && selected.id !in listedIds) {
                     ProviderDetail(
                         descriptor = selected,
                         state = state,
@@ -557,15 +558,23 @@ private fun ProviderDetail(
     val ollamaBlocked =
         descriptor.id == ProviderRegistry.OLLAMA && state.ollamaSystemInfo?.meetsMinimum == false
 
+    val revealEditor = remember(descriptor.id) { BringIntoViewRequester() }
+    var editorPlaced by remember(descriptor.id) { mutableStateOf(false) }
+    LaunchedEffect(descriptor.id, editorPlaced) {
+        if (editorPlaced) revealEditor.bringIntoView()
+    }
+
     // One card for the whole editor — title through the activate button — rather than two
     // separate cards (key section, model section) with a header floating above both. Add and
     // edit are the same form, so there is exactly one boundary to open and close.
-    BossCard(modifier = Modifier.fillMaxWidth()) {
+    BossCard(modifier = Modifier.fillMaxWidth()
+        .bringIntoViewRequester(revealEditor)
+        .onGloballyPositioned { editorPlaced = true }) {
         Column(
             modifier = Modifier.padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End) {
                 if (showTitle) {
                     Text(
                         text = descriptor.displayName,
@@ -573,8 +582,6 @@ private fun ProviderDetail(
                         color = BossThemeColors.TextPrimary,
                         modifier = Modifier.weight(1f),
                     )
-                } else {
-                    Spacer(modifier = Modifier.weight(1f))
                 }
                 BossSecondaryButton(text = "Cancel", onClick = onCancel, enabled = !busy)
             }

@@ -6,7 +6,6 @@ import ai.rever.boss.plugin.api.LlmApiFormat
 import ai.rever.boss.plugin.api.LlmConfig
 import ai.rever.boss.plugin.api.LlmProviderSettingsAPI
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 
 /**
@@ -29,9 +28,7 @@ class LlmProviderSettingsApiImpl(
 
     @Composable
     override fun LlmProviderSettingsPanel(modifier: Modifier) {
-        // The host renders this section on demand; loading here (rather than at
-        // registration) keeps provider fetches off app startup.
-        LaunchedEffect(Unit) { viewModel.load() }
+        // The shared panel owns entry loading for both rendering paths.
         AiProvidersPanel(viewModel = viewModel, modifier = modifier)
     }
 

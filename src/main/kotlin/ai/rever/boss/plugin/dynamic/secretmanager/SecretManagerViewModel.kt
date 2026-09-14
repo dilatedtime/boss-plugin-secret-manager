@@ -726,6 +726,10 @@ class SecretManagerViewModel(
         }
     }
 
+    fun reportAiProviderUnavailable() {
+        state = state.copy(errorMessage = "This AI provider is unavailable. Refresh or check that AI support is loaded.")
+    }
+
     fun clearError() {
         state = state.copy(errorMessage = null)
     }
