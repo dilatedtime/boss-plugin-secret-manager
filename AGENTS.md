@@ -398,8 +398,10 @@ opened*, which counts engine-list reads rather than watching state, so a probe t
 slowly still fails it. `openingTheSectionTwiceProbesOnce` pins the idempotence the panel relies on,
 since it calls `ensureSectionLoaded()` from a `LaunchedEffect` on every entry.
 
-Consumer discovery still reads the selected CLI id (a preference, without enumerating engines or
-running health probes) before choosing an automatic HTTP default. The panel's `activeCliEngineId`
+Consumer discovery still reads the selected CLI id through the gateway registry on IO, without
+enumerating engines or running health probes before choosing an automatic HTTP default. This applies to both managed recommendations and
+configured HTTP providers without an explicit saved selection: consumers must not silently choose
+HTTP while a CLI selection is active. The panel's `activeCliEngineId`
 is populated only on entry now, so trusting it during startup or sign-in recovery would silently
 select BOSS AI over an existing CLI choice. `BossAiDiscoveryTest` covers both paths before panel entry.
 
@@ -1194,6 +1196,11 @@ for this time is not — so `enterSection()` closes the old editor and keeps the
 `requestProviderOnEntry()` command is the exception: it opens that provider on the next entry.
 The shared panel owns this path, including environment refresh, legacy import and a local Ollama
 probe before vault loading; the compatibility host wrapper must not start a second load.
+Entry clears all unsaved drafts on this plugin-owned ViewModel, including a compatibility view
+open in another window. Refresh, including its cold path, preserves the editor and draft.
+Legacy import dismissal lasts for the session and never retires an unimported file.
+Catalog sweep deduplication compares the probed machine snapshot too, so a sweep from before an
+Ollama installation cannot satisfy a later local-setup refresh.
 
 This matters because the ViewModel is the plugin's **single instance**, shared between the sidebar
 AI tab, consumer APIs and older hosts' compatibility settings (see "Three sections, and the AI one is not owned

@@ -212,7 +212,14 @@ class AiProvidersViewModel(
 
     fun enterSection(): Job {
         ensureSectionLoaded()
-        return load(providerOnNextEntry.getAndSet(null))
+        val providerToOpen = providerOnNextEntry.getAndSet(null)
+        // Entry closes transient editors across the shared panel instances and drops drafts.
+        // Data refresh is deliberately separate: it must never discard a key being typed.
+        _state.update {
+            it.copy(isEditorOpen = providerToOpen != null,
+                selectedProviderId = providerToOpen ?: it.selectedProviderId, keyDrafts = emptyMap())
+        }
+        return load()
     }
 
     /** Guards [ensureConnectionsLoaded] so concurrent callers load credentials once. */
@@ -224,7 +231,8 @@ class AiProvidersViewModel(
     private val hasCatalogRefreshed = AtomicBoolean(false)
     private val lastCatalogRefreshNanos = AtomicLong(0)
     private val lastCatalogRefreshGeneration = AtomicLong(-1)
-    private val lastOllamaProbeNanos = AtomicLong(0)
+    private val lastCatalogOllamaInfo = AtomicReference<OllamaSystemInfo?>(null)
+    private val legacyOfferDismissed = AtomicBoolean(false)
     private val _catalogsLoaded = MutableStateFlow(false)
     /** False until the first catalog sweep finishes; an empty list before that is not definitive. */
     val catalogsLoaded: StateFlow<Boolean> = _catalogsLoaded.asStateFlow()
@@ -371,7 +379,7 @@ class AiProvidersViewModel(
                     return@launch
                 }
                 val generation = catalogRefreshGeneration.get()
-                refreshCatalogs(state.value.connections, requestedAtNanos, generation, refreshOllamaProbe = false)
+                refreshCatalogs(state.value.connections, requestedAtNanos, generation)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
@@ -395,30 +403,20 @@ class AiProvidersViewModel(
         connections: Map<String, ProviderConnection>,
         requestedAtNanos: Long,
         generation: Long,
-        refreshOllamaProbe: Boolean,
     ) {
         catalogRefreshMutex.withLock {
             val catalogRequestSatisfied = hasCatalogRefreshed.get() &&
                 lastCatalogRefreshGeneration.get() == generation &&
                 lastCatalogRefreshNanos.get() >= requestedAtNanos
-            val probeRequestSatisfied =
-                !refreshOllamaProbe ||
-                    (state.value.ollamaSystemInfo != null && lastOllamaProbeNanos.get() >= requestedAtNanos)
-            if (catalogRequestSatisfied && probeRequestSatisfied) return
-            // Consumer polling reuses the previous probe. Panel entry forces one so a user who
-            // just followed the installer link sees Ollama without restarting BOSS.
-            var probeRan = false
-            if (refreshOllamaProbe || state.value.ollamaSystemInfo == null) {
-                readOllamaSystemInfo()
-                lastOllamaProbeNanos.set(monotonicNanos())
-                probeRan = true
-            }
+            // Entry and Refresh probe independently of credential availability. A sweep
+            // under an older machine snapshot cannot satisfy a newly installed daemon.
+            if (state.value.ollamaSystemInfo == null) readOllamaSystemInfo()
+            val probeInfo = state.value.ollamaSystemInfo
             if (generation != catalogRefreshGeneration.get()) return
-            // A newly installed daemon changes what refreshStale should fetch, even when an
-            // overlapping sweep already satisfied every catalog under the previous probe.
-            if (catalogRequestSatisfied && !probeRan) return
+            if (catalogRequestSatisfied && lastCatalogOllamaInfo.get() == probeInfo) return
             if (!_catalogsLoaded.value) catalog.seedFromCache()
             refreshStale(connections)
+            lastCatalogOllamaInfo.set(probeInfo)
             hasCatalogRefreshed.set(true)
             lastCatalogRefreshNanos.set(monotonicNanos())
             lastCatalogRefreshGeneration.set(generation)
@@ -447,9 +445,8 @@ class AiProvidersViewModel(
                     .forEach { catalog.markNotConfigured(it.id) }
             }
             connectionGeneration = startedAt
-            // Selection is a cheap preference read; engine enumeration/health stays lazy.
-            // Consumer discovery must respect a CLI selected before this panel opens.
-            val selectedCli = runCatching { cliEngines?.selectedEngineId() }.getOrNull()
+            // Consult the gateway selection without enumerating engines or probing health.
+            val selectedCli = selectedCliEngineId()
 
             _state.update { current ->
                 val preferred = current.activeProviderId ?: storedActive
@@ -462,7 +459,7 @@ class AiProvidersViewModel(
                     activeProviderId = if (snapshot?.sharedDiscoveryComplete == false &&
                         preferred?.let(::isManagedProvider) == true) {
                         preferred
-                    } else if (preferred == null && selectedCli != null) {
+                    } else if (preferred == null && (selectedCli != null || current.activeCliEngineId != null)) {
                         null
                     } else initialProviderId(preferred, descriptors, connections),
                     storeAvailable = store != null && snapshot?.storeReadFailed != true,
@@ -521,7 +518,7 @@ class AiProvidersViewModel(
     }
 
     /** Load credentials, seed cached model lists, then refresh anything stale. */
-    fun load(providerToOpen: String? = null): Job {
+    fun load(): Job {
         connectionsLoadStarted.set(true)
         catalogsLoadStarted.set(true)
         val catalogRequestedAtNanos = monotonicNanos()
@@ -530,15 +527,7 @@ class AiProvidersViewModel(
         // is the panel's own "this entry is still settling" signal, and a caller that returns
         // from load() to a state still reading `isLoading = false` is being told the load
         // already finished. Nothing about the flag needs the coroutine.
-        _state.update {
-            it.copy(
-                isLoading = true,
-                error = null,
-                isEditorOpen = providerToOpen != null,
-                selectedProviderId = providerToOpen ?: it.selectedProviderId,
-                keyDrafts = emptyMap(),
-            )
-        }
+        _state.update { it.copy(isLoading = true, error = null) }
         return scope.launch {
             // Re-read the environment on every entry into the section. The panel tells
             // users they can unset a variable to take key management over in BOSS, and the
@@ -558,12 +547,12 @@ class AiProvidersViewModel(
                     isLoading = false,
                     // An entry command may have disappeared during discovery. Never
                     // render the fallback provider's editor for that stale id.
-                    isEditorOpen = current.isEditorOpen && descriptorOf(current.selectedProviderId) != null,
+                    isEditorOpen = current.isEditorOpen && current.providers.any { it.id == current.selectedProviderId },
                     // Keep whichever provider the user had expanded. This runs from a
                     // LaunchedEffect on every entry into the section, so resetting the
                     // selection here discarded their place each time.
                     selectedProviderId =
-                        current.selectedProviderId.takeIf { descriptorOf(it) != null }
+                        current.selectedProviderId.takeIf { id -> current.providers.any { it.id == id } }
                             ?: current.activeProviderId
                             ?: firstConfigured(connections)
                             ?: ProviderRegistry.default.id,
@@ -583,7 +572,6 @@ class AiProvidersViewModel(
                 connections,
                 catalogRequestedAtNanos,
                 catalogGeneration,
-                refreshOllamaProbe = false,
             )
         }
     }
@@ -747,13 +735,6 @@ class AiProvidersViewModel(
     }
 
     /**
-     * Load the engine list and probe each one.
-     *
-     * The probes run one at a time and update the state as they answer, so a slow or missing
-     * binary delays its own row rather than the section. Each spawns a process, which is why
-     * this is called on load and from Refresh rather than per composition.
-     */
-    /**
      * Re-read whether the gateway is here.
      *
      * Never cached, for the same reason `GatewayCliEngineAccess` resolves the api per call: the
@@ -894,6 +875,13 @@ class AiProvidersViewModel(
         }
     }
 
+    /**
+     * Load the engine list and probe each one.
+     *
+     * The probes run one at a time and update the state as they answer, so a slow or missing
+     * binary delays its own row rather than the section. Each spawns a process, which is why
+     * this is called on first panel entry and from Refresh rather than per composition.
+     */
     fun refreshCliEngines() {
         val access = cliEngines ?: return
         scope.launch(Dispatchers.IO) {
@@ -1172,6 +1160,7 @@ class AiProvidersViewModel(
     }
 
     fun dismissLegacyOffer() {
+        legacyOfferDismissed.set(true)
         _state.update { it.copy(legacyOffer = null) }
     }
 
@@ -1180,13 +1169,27 @@ class AiProvidersViewModel(
     }
 
     private suspend fun checkLegacyImport() {
-        val offer = legacyImport?.inspectAndRetireIfEmpty() ?: return
-        _state.update { it.copy(legacyOffer = offer) }
-        logger.info(
-            LogCategory.SYSTEM,
-            "Legacy AI provider keys available to import",
-            mapOf("providers" to offer.providerIds.size),
-        )
+        if (legacyOfferDismissed.get()) return
+        val offer = try {
+            legacyImport?.inspectAndRetireIfEmpty()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            logger.warn(LogCategory.SYSTEM, "Could not inspect legacy AI settings")
+            return
+        }
+        _state.update { if (legacyOfferDismissed.get()) it else it.copy(legacyOffer = offer) }
+    }
+
+    /** Gateway lookup crosses the host registry; keep it off Main and preserve cancellation. */
+    private suspend fun selectedCliEngineId(): String? = withContext(Dispatchers.IO) {
+        try {
+            cliEngines?.selectedEngineId()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /**
@@ -1245,14 +1248,21 @@ class AiProvidersViewModel(
      * scope that is not a supervisor, silently killing every later launch in the plugin.
      */
     fun refreshConnections(): Job = scope.launch(Dispatchers.IO) {
-        store?.expireSharedDefinitions()
-        if (!_connectionsLoaded.value) {
-            load().join()
-        } else {
-            envResolver.invalidate()
-            readOllamaSystemInfo()
-            checkLegacyImport()
-            reloadConnectionsSafely()
+        try {
+            store?.expireSharedDefinitions()
+            if (!_connectionsLoaded.value) {
+                load().join()
+            } else {
+                envResolver.invalidate()
+                readOllamaSystemInfo()
+                checkLegacyImport()
+                reloadConnectionsSafely()
+                refreshCatalogs(state.value.connections, monotonicNanos(), catalogRefreshGeneration.get())
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            logger.warn(LogCategory.NETWORK, "Could not refresh AI provider setup")
         }
     }
 
@@ -1294,7 +1304,7 @@ class AiProvidersViewModel(
         connectionGeneration = startedAt
         val removed = previous.keys - preferredConnections.keys
         val savedActive = prefs.read()
-        val selectedCli = runCatching { cliEngines?.selectedEngineId() }.getOrNull()
+        val selectedCli = selectedCliEngineId()
         removed.forEach(catalog::markNotConfigured)
         _state.update { current ->
             val activeRemoved = reloaded.sharedDiscoveryComplete &&
@@ -1309,6 +1319,7 @@ class AiProvidersViewModel(
                             it.sharedDefault && preferredConnections[it.id]?.isConfigured == true
                         }?.id
                     } else null,
+                isEditorOpen = current.isEditorOpen && current.selectedProviderId in nextDescriptors,
                 selectedProviderId = current.selectedProviderId.takeIf { it in nextDescriptors }
                     ?: ProviderRegistry.default.id,
                 storeAvailable = !reloaded.storeReadFailed,
@@ -1342,7 +1353,7 @@ class AiProvidersViewModel(
                 // another secret edit must be able to refresh the credential snapshot promptly.
                 scope.launch(Dispatchers.IO) {
                     try {
-                        refreshCatalogs(connections, requestedAtNanos, generation, refreshOllamaProbe = false)
+                        refreshCatalogs(connections, requestedAtNanos, generation)
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (_: Exception) {

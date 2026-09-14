@@ -173,6 +173,44 @@ class AiProvidersPanelStateTest {
     }
 
     @Test
+    fun coldRefreshPreservesTheOpenEditorAndDraft() = runBlocking {
+        val vm = viewModel()
+        assertFalse(vm.connectionsLoaded.value)
+        vm.selectProvider(ProviderRegistry.OPENAI)
+        vm.updateKeyDraft(ProviderRegistry.OPENAI, "unsaved-test-key")
+        withTimeout(TIMEOUT_MS) { vm.refreshConnections().join() }
+        assertTrue(vm.state.value.isEditorOpen)
+        assertEquals(ProviderRegistry.OPENAI, vm.state.value.selectedProviderId)
+        assertEquals("unsaved-test-key", vm.state.value.keyDrafts[ProviderRegistry.OPENAI])
+    }
+
+    @Test
+    fun dismissingLegacyImportLastsAcrossEntryAndRefresh() = runBlocking {
+        val root = tempDir("dismiss-legacy")
+        val file = File(root, "legacy.json").also { it.writeText("legacy fixture") }
+        val vm = viewModel(root = root, legacyFile = file)
+        vm.loaded()
+        assertNotNull(vm.state.value.legacyOffer)
+        vm.dismissLegacyOffer()
+        vm.loaded()
+        assertNull(vm.state.value.legacyOffer)
+        withTimeout(TIMEOUT_MS) { vm.refreshConnections().join() }
+        assertNull(vm.state.value.legacyOffer)
+        assertTrue(file.exists(), "dismissal does not retire unimported credentials")
+    }
+
+    @Test
+    fun refreshDiscoversANewlyInstalledDaemonWithoutCredentialChanges() = runBlocking {
+        val installed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val vm = viewModel(isOllamaInstalled = installed::get)
+        vm.loaded()
+        assertFalse(vm.state.value.catalogOf(ProviderRegistry.OLLAMA) is CatalogState.Loaded)
+        installed.set(true)
+        withTimeout(TIMEOUT_MS) { vm.refreshConnections().join() }
+        assertTrue(vm.state.value.catalogOf(ProviderRegistry.OLLAMA) is CatalogState.Loaded)
+    }
+
+    @Test
     fun sectionEntryChecksLocalOllamaEvenWhenVaultReadsFail() = runBlocking {
         val vm = viewModel(secrets = FakeSecretDataProvider(emptyList(), failReads = true))
         vm.loaded()

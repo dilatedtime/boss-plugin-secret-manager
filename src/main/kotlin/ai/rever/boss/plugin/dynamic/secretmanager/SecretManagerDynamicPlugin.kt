@@ -198,8 +198,8 @@ class SecretManagerDynamicPlugin : DynamicPlugin {
             context.registerPluginAPI(LlmProviderSettingsApiImpl(viewModel))
 
             // Warm the credentials so the first AI action after a restart doesn't race
-            // the load. Network-free — model lists are still fetched lazily, when the
-            // panel is opened or refreshed, so this costs nothing at startup.
+            // the asynchronous vault/broker load. Model catalogs and CLI health probes
+            // remain demand-driven; credential loading itself may use the network.
             viewModel.ensureConnectionsLoaded()
             return viewModel
         } catch (_: LinkageError) {

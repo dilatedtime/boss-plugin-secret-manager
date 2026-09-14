@@ -247,9 +247,12 @@ class SharedProviderReviewTest {
             api.activeConfig()
             withTimeout(10_000) { vm.catalogsLoaded.first { it } }
             assertNotNull(api.activeConfig())
+            vm.selectProvider(descriptor.id)
+            assertTrue(vm.state.value.isEditorOpen)
             vault.entries = emptyList()
             vm.refreshConnections()
             withTimeout(10_000) { vm.state.first { state -> state.providers.none { it.id == descriptor.id } } }
+            assertFalse(vm.state.value.isEditorOpen, "a removed share must not open the default provider editor")
             assertNull(vm.state.value.activeProviderId)
             assertNull(api.activeConfig())
             assertEquals(CatalogState.NotConfigured, catalog.stateOf(descriptor.id))

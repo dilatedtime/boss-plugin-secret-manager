@@ -90,9 +90,10 @@ class CliEngineSelectionTest {
             useLaunchctl = false,
         )
 
-    private fun viewModelWith(cli: CliEngineAccess?): AiProvidersViewModel {
+    private fun viewModelWith(cli: CliEngineAccess?, initialEnv: String = ""): AiProvidersViewModel {
         val root = tempDir("cli-selection")
         val env = envIn(root)
+        File(root, "env_vars").writeText(initialEnv)
         val scope = CoroutineScope(Dispatchers.Default + SupervisorJob()).also { scopes.add(it) }
         return AiProvidersViewModel(
             store = ProviderCredentialStore(FakeSecretDataProvider(emptyList()), env),
@@ -119,6 +120,17 @@ class CliEngineSelectionTest {
         ensureSectionLoaded()
         withTimeout(TIMEOUT_MS) { state.first { it.cliEngines.isNotEmpty() } }
         return state.value.cliEngines
+    }
+
+    @Test
+    fun existingCliSelectionAlsoPreventsImplicitActivationOfAConfiguredHttpProvider() = runBlocking {
+        val cli = FakeCliEngines().also { it.selectEngine("claude") }
+        val vm = viewModelWith(cli, initialEnv = "OPENAI_API_KEY=test-only-key")
+        vm.ensureConnectionsLoaded()
+        withTimeout(TIMEOUT_MS) { vm.connectionsLoaded.first { it } }
+        assertTrue(vm.state.value.connectionOf(ProviderRegistry.OPENAI).isConfigured)
+        assertNull(vm.state.value.activeProviderId, "implicit HTTP defaults must not preempt an existing CLI choice")
+        assertEquals(0, cli.engineListReads)
     }
 
     @Test
