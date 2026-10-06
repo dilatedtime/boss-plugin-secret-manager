@@ -3,10 +3,12 @@
 Encrypted credentials, the secrets other people share with you, Plugin Store publish keys, and
 every AI provider setting in BOSS.
 
-A right-hand sidebar panel over the host's `SecretDataProvider`, plus the `Settings > AI
-Providers` section: this plugin owns **all** AI provider configuration for the application.
-The host has none of its own, and `PluginContext.llmProvider` is relayed from the instance
-registered here.
+A right-hand sidebar panel over the host's `SecretDataProvider`. Its three sections are
+**Secrets**, **Shared with me**, and **AI**. This plugin owns all AI provider configuration for
+the application. The host has none of its own, and `PluginContext.llmProvider` is relayed from
+the instance registered here.
+
+This repository is a fork of [risa-labs-inc/boss-plugin-secret-manager](https://github.com/risa-labs-inc/boss-plugin-secret-manager).
 
 It is also the *only* secrets plugin: the separate **My Secrets** (`user-secret-list`) panel
 is retired, and its list is this panel's "Shared with me" section. See
@@ -23,9 +25,9 @@ is retired, and its list is this panel's "Shared with me" section. See
 - **Sharing**: share a secret with individual users (searched through Supabase) or with whole
   RBAC roles, each at an access level, and unshare again.
 - **AI**: a third section holding every AI credential in BOSS - local CLI sessions (a `claude` or
-  `codex` login you already have), provider API keys, and a model picker driven by each provider's
-  live list. The same panel the host renders at Settings, AI Providers, from one definition rather
-  than a second copy: the keys live in this vault, so the page that manages them belongs here too.
+  `codex` login you already have), provider API keys, managed BOSS AI access, shared managed
+  providers, Ollama, and a model picker driven by each provider's live list. The keys live in this
+  vault, so the page that manages them sits beside the secrets instead of in host Settings.
   When the AI Gateway plugin is missing the section says so and offers to install it, because
   without the gateway there are no CLI sessions and no common AI interface for other plugins.
 - **Plugin Store publish keys**: create, list and revoke them, with a `publish` scope checkbox. The
@@ -40,9 +42,9 @@ Credential precedence is environment, then stored, then none. Environment values
 the process environment, system properties, macOS `launchctl`, and finally `~/.boss/env_vars`.
 **A key supplied by the environment is never written back to disk.**
 
-## Two sections, not two panels
+## Two secret sections, not two panels
 
-The panel has two segmented sections, and they partition the vault rather than overlap it:
+The first two sections partition the vault rather than overlap it:
 
 | Section | Reads | Rows | Controls |
 |---|---|---|---|
@@ -138,8 +140,7 @@ ungated, and sharing with an organisation already requires membership of it.
 
 ## Requirements
 
-- BOSS >= 9.4.2, boss-plugin-api >= 1.0.73 (both from `plugin.json`; the older 9.2.20 /
-  1.0.20 pair stated here was stale)
+- BOSS >= 9.4.2, boss-plugin-api >= 1.0.89
 - The panel is visible to every authenticated user only on a host carrying migration
   `20260809000000`, which grants `secret.read` to the baseline `user` role. On an older
   host only admins and `boss_admin` can open it, and nothing else changes.
@@ -148,16 +149,16 @@ ungated, and sharing with an organisation already requires membership of it.
 - Optional: `supabaseDataProvider` (user and role search for sharing),
   `pluginStoreApiKeyProvider`, `settingsProvider`, `splitViewOperations`, `cacheProvider`.
 - Network egress to each provider's models endpoint.
-- The AI providers section additionally needs **api 1.0.71**. That dependency is confined to
-  one file and registered inside a `LinkageError` guard, so on an older host the AI section is
-  simply absent and secret management still works.
+- The AI section is registered behind a `LinkageError` guard so a malformed host API installation
+  cannot take down secret management. The declared 1.0.89 API floor covers the model-discovery
+  types in its public interface.
 
 ## Build
 
 ```bash
 ./gradlew buildPluginJar
 cp build/libs/boss-plugin-secret-manager-*.jar ~/.boss/plugins/
-./gradlew test    # 214 host-independent cases, no live credential needed
+./gradlew test    # 302 host-independent cases, no live credential needed
 ```
 
 Do not delete `compose-stability.conf`. It stops the Compose compiler emitting a `$stable` read
